@@ -199,6 +199,42 @@ class OzonClient:
         total_sum = sum(float(r.get("price", r.get("commissions_amount", 0)) or 0) for r in all_r)
         return {"count": len(all_r), "sum": total_sum}
 
+    def get_warehouse_stocks(self):
+        """POST /v3/product/info/stocks — остатки на складах FBO с ценами."""
+        all_items, offset = [], 0
+        while True:
+            payload = {"limit": 1000, "offset": offset}
+            r = self.session.post(f"{self.BASE_URL}/v3/product/info/stocks",
+                                  data=json.dumps(payload), timeout=30)
+            if not r.ok:
+                break
+            data = r.json().get("result", {})
+            items = data.get("items", [])
+            all_items.extend(items)
+            if len(items) < 1000:
+                break
+            offset += 1000
+        return all_items
+
+    def get_product_prices(self, product_ids: list):
+        """POST /v5/product/info/prices — цены товаров для расчёта капитализации."""
+        if not product_ids:
+            return []
+        payload = {"filter": {"product_id": product_ids[:1000]}, "limit": 1000, "offset": 0}
+        r = self.session.post(f"{self.BASE_URL}/v5/product/info/prices",
+                              data=json.dumps(payload), timeout=30)
+        if r.ok:
+            return r.json().get("result", {}).get("items", [])
+        return []
+
+    def get_localization(self):
+        """POST /v1/analytics/item-localization — уровень локализации по SKU."""
+        r = self.session.post(f"{self.BASE_URL}/v1/analytics/item-localization",
+                              data=json.dumps({"limit": 1000, "offset": 0}), timeout=30)
+        if r.ok:
+            return r.json().get("result", {}).get("items", [])
+        return []
+
 
 # ─────────────────────────────────────────────
 # DATA TRANSFORMATION
@@ -264,8 +300,33 @@ MOCK_SKUS = [
     ("101008", "Умная колонка Яндекс Макс"),
 ]
 
-MOCK_BALANCE  = 342_815.50   # демо-баланс
-MOCK_RETURNS  = {"count": 47, "sum": 184_320.0}  # демо-возвраты
+MOCK_BALANCE  = 342_815.50
+MOCK_RETURNS  = {"count": 47, "sum": 184_320.0}
+MOCK_WAREHOUSE = {
+    "total_sum": 4_821_500.0,
+    "total_units": 1_243,
+    "items": [
+        {"sku_id": "101001", "sku_name": "Кроссовки Nike Air Max 270",     "units": 145, "sum": 724_550.0},
+        {"sku_id": "101002", "sku_name": "Смартфон Samsung Galaxy A54",    "units": 82,  "sum": 1_312_000.0},
+        {"sku_id": "101003", "sku_name": "Наушники Sony WH-1000XM5",       "units": 210, "sum": 630_000.0},
+        {"sku_id": "101004", "sku_name": "Ноутбук ASUS VivoBook 15",       "units": 34,  "sum": 1_088_000.0},
+        {"sku_id": "101005", "sku_name": "Кофемашина DeLonghi Magnifica",  "units": 56,  "sum": 448_000.0},
+        {"sku_id": "101006", "sku_name": "Пылесос Dyson V15",              "units": 28,  "sum": 364_000.0},
+        {"sku_id": "101007", "sku_name": "Планшет iPad 10th Gen",          "units": 67,  "sum": 201_000.0},
+        {"sku_id": "101008", "sku_name": "Умная колонка Яндекс Макс",      "units": 621, "sum": 53_950.0},
+    ]
+}
+MOCK_LOCALIZATION = [
+    {"sku_id": "101001", "sku_name": "Кроссовки Nike Air Max 270",    "clusters": 21},
+    {"sku_id": "101002", "sku_name": "Смартфон Samsung Galaxy A54",   "clusters": 23},
+    {"sku_id": "101003", "sku_name": "Наушники Sony WH-1000XM5",      "clusters": 18},
+    {"sku_id": "101004", "sku_name": "Ноутбук ASUS VivoBook 15",      "clusters": 14},
+    {"sku_id": "101005", "sku_name": "Кофемашина DeLonghi Magnifica", "clusters": 9},
+    {"sku_id": "101006", "sku_name": "Пылесос Dyson V15",             "clusters": 19},
+    {"sku_id": "101007", "sku_name": "Планшет iPad 10th Gen",         "clusters": 23},
+    {"sku_id": "101008", "sku_name": "Умная колонка Яндекс Макс",     "clusters": 7},
+]
+TOTAL_CLUSTERS = 23
 
 
 def generate_mock_data(date_from: date, date_to: date) -> pd.DataFrame:
@@ -438,6 +499,59 @@ def load_real_returns(_cid, _key, df_str, dt_str):
     return client.get_returns(df_str, dt_str)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_real_warehouse(_cid, _key):
+    """Загружает остатки FBO и считает капитализацию."""
+    client = OzonClient(client_id=_cid, api_key=_key)
+    stocks = client.get_warehouse_stocks()
+    if not stocks:
+        return MOCK_WAREHOUSE
+
+    # Собираем product_id для запроса цен
+    product_ids = [str(item.get("product_id", "")) for item in stocks if item.get("product_id")]
+    prices_list = client.get_product_prices(product_ids[:1000])
+    price_map = {}
+    for p in prices_list:
+        pid = str(p.get("product_id", ""))
+        price = float(p.get("price", {}).get("price", 0) or 0)
+        price_map[pid] = price
+
+    result_items, total_sum, total_units = [], 0.0, 0
+    for item in stocks:
+        pid  = str(item.get("product_id", ""))
+        name = item.get("name", pid)
+        sku  = str(item.get("offer_id", pid))
+        # суммируем FBO остатки по всем складам
+        fbo_stocks = item.get("stocks", [])
+        units = sum(int(s.get("present", 0)) for s in fbo_stocks if s.get("type") == "fbo")
+        price = price_map.get(pid, 0.0)
+        item_sum = units * price
+        total_sum   += item_sum
+        total_units += units
+        if units > 0:
+            result_items.append({"sku_id": sku, "sku_name": name, "units": units, "sum": item_sum})
+
+    result_items.sort(key=lambda x: x["sum"], reverse=True)
+    return {"total_sum": total_sum, "total_units": total_units, "items": result_items[:50]}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_real_localization(_cid, _key):
+    """Загружает уровень локализации по SKU."""
+    client = OzonClient(client_id=_cid, api_key=_key)
+    items = client.get_localization()
+    if not items:
+        return MOCK_LOCALIZATION
+    result = []
+    for item in items:
+        result.append({
+            "sku_id":   str(item.get("sku", item.get("product_id", ""))),
+            "sku_name": item.get("name", ""),
+            "clusters": int(item.get("clusters_count", item.get("warehouses_count", 0))),
+        })
+    return sorted(result, key=lambda x: x["clusters"], reverse=True)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_mock_data(df, dt):
     return generate_mock_data(df, dt)
@@ -448,16 +562,20 @@ if "df" not in st.session_state or fetch_btn:
         load_real_data.clear()
         load_real_balance.clear()
         load_real_returns.clear()
+        load_real_warehouse.clear()
+        load_real_localization.clear()
         load_mock_data.clear()
     with st.spinner("Загрузка данных…"):
         try:
             if USE_MOCK:
-                st.session_state.df      = load_mock_data(date_from, date_to)
-                st.session_state.df_kpi  = load_mock_data(kpi_date_from, kpi_date_to)
-                st.session_state.balance = MOCK_BALANCE
-                st.session_state.balance_raw = {}
-                st.session_state.returns = MOCK_RETURNS
-                st.session_state.data_error = None
+                st.session_state.df           = load_mock_data(date_from, date_to)
+                st.session_state.df_kpi       = load_mock_data(kpi_date_from, kpi_date_to)
+                st.session_state.balance      = MOCK_BALANCE
+                st.session_state.balance_raw  = {}
+                st.session_state.returns      = MOCK_RETURNS
+                st.session_state.warehouse    = MOCK_WAREHOUSE
+                st.session_state.localization = MOCK_LOCALIZATION
+                st.session_state.data_error   = None
             else:
                 df_str  = date_from.strftime("%Y-%m-%d")
                 dt_str  = date_to.strftime("%Y-%m-%d")
@@ -476,20 +594,32 @@ if "df" not in st.session_state or fetch_btn:
                     st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
                 except Exception:
                     st.session_state.returns = MOCK_RETURNS
+                try:
+                    st.session_state.warehouse = load_real_warehouse(client_id, api_key)
+                except Exception:
+                    st.session_state.warehouse = MOCK_WAREHOUSE
+                try:
+                    st.session_state.localization = load_real_localization(client_id, api_key)
+                except Exception:
+                    st.session_state.localization = MOCK_LOCALIZATION
                 st.session_state.data_error = None
         except Exception as e:
-            st.session_state.data_error = str(e)
-            st.session_state.df      = load_mock_data(date_from, date_to)
-            st.session_state.df_kpi  = load_mock_data(kpi_date_from, kpi_date_to)
-            st.session_state.balance = MOCK_BALANCE
-            st.session_state.balance_raw = {}
-            st.session_state.returns = MOCK_RETURNS
+            st.session_state.data_error   = str(e)
+            st.session_state.df           = load_mock_data(date_from, date_to)
+            st.session_state.df_kpi       = load_mock_data(kpi_date_from, kpi_date_to)
+            st.session_state.balance      = MOCK_BALANCE
+            st.session_state.balance_raw  = {}
+            st.session_state.returns      = MOCK_RETURNS
+            st.session_state.warehouse    = MOCK_WAREHOUSE
+            st.session_state.localization = MOCK_LOCALIZATION
             USE_MOCK = True
 
 df: pd.DataFrame     = st.session_state.df
 df_kpi: pd.DataFrame = st.session_state.get("df_kpi", st.session_state.df)
 balance: float       = st.session_state.get("balance", MOCK_BALANCE)
 returns: dict        = st.session_state.get("returns", MOCK_RETURNS)
+warehouse: dict      = st.session_state.get("warehouse", MOCK_WAREHOUSE)
+localization: list   = st.session_state.get("localization", MOCK_LOCALIZATION)
 
 for col in METRIC_KEYS:
     if col not in df.columns:
@@ -639,7 +769,29 @@ kpi_period = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.
 # ─────────────────────────────────────────────
 # KPI CARDS  (4 карточки)
 # ─────────────────────────────────────────────
-st.markdown(f'<div class="section-title">📊 Ключевые показатели · {kpi_period}</div>', unsafe_allow_html=True)
+# ─────────────────────────────────────────────
+# KPI DATE PICKER — inline прямо над карточками
+# ─────────────────────────────────────────────
+st.markdown('<div class="section-title">📊 Ключевые показатели</div>', unsafe_allow_html=True)
+
+dp_col1, dp_col2, dp_col3, dp_spacer = st.columns([1.5, 1.5, 1.5, 5])
+with dp_col1:
+    new_kpi_from = st.date_input("От", value=kpi_date_from, key="kpi_dp_from", label_visibility="collapsed")
+with dp_col2:
+    new_kpi_to = st.date_input("До", value=kpi_date_to, key="kpi_dp_to", label_visibility="collapsed")
+with dp_col3:
+    if st.button("Применить", key="kpi_apply", use_container_width=True):
+        st.session_state.kpi_date_from = new_kpi_from
+        st.session_state.kpi_date_to   = new_kpi_to
+        for _k in ["df_kpi", "returns"]:
+            st.session_state.pop(_k, None)
+        load_real_data.clear()
+        load_real_returns.clear()
+        st.rerun()
+
+kpi_date_from = st.session_state.kpi_date_from
+kpi_date_to   = st.session_state.kpi_date_to
+kpi_period    = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
 
 c1, c2, c3, c4 = st.columns(4)
 
@@ -760,6 +912,93 @@ rename = {"sku_id": "SKU ID", "sku_name": "Товар", "revenue": "Продаж
 disp = disp.rename(columns=rename)
 show_cols = [c for c in ["SKU ID", "Товар", "Продажи", "Заказов", "Просмотров", "Конверсия"] if c in disp.columns]
 st.dataframe(disp[show_cols], use_container_width=True, height=380)
+
+# ─────────────────────────────────────────────
+# WAREHOUSE CAPITALIZATION
+# ─────────────────────────────────────────────
+st.markdown('<div class="section-title">🏭 Капитализация складов</div>', unsafe_allow_html=True)
+
+wh_sum   = warehouse.get("total_sum", 0)
+wh_units = warehouse.get("total_units", 0)
+wh_items = warehouse.get("items", [])
+
+wh_c1, wh_c2 = st.columns([1, 3], gap="large")
+
+with wh_c1:
+    avg_price = wh_sum / wh_units if wh_units else 0
+    wh_sum_fmt   = f"₽{wh_sum:,.0f}".replace(",", " ")
+    wh_units_fmt = f"{wh_units:,} шт".replace(",", " ")
+    avg_fmt      = f"₽{avg_price:,.0f}".replace(",", " ")
+    wh_c1.markdown(f"""
+        <div class="metric-card card-balance" style="height:auto">
+          <div class="metric-label">🏭 Итого на складах</div>
+          <div class="metric-row">
+            <span class="metric-main">{wh_sum_fmt}</span>
+          </div>
+          <div style="font-size:14px;color:#c8d0ee;margin:6px 0">/</div>
+          <div class="metric-sub">{wh_units_fmt}</div>
+          <div class="metric-delta delta-neu" style="margin-top:8px">Ср. цена {avg_fmt}</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+with wh_c2:
+    if wh_items:
+        wh_df = pd.DataFrame(wh_items)
+        wh_df["sum_fmt"]   = wh_df["sum"].apply(lambda x: f"₽{x:,.0f}".replace(",", " "))
+        wh_df["units_fmt"] = wh_df["units"].apply(lambda x: f"{x:,} шт".replace(",", " "))
+        wh_df["share"]     = (wh_df["sum"] / wh_sum * 100).apply(lambda x: f"{x:.1f}%") if wh_sum else "—"
+        wh_disp = wh_df[["sku_id", "sku_name", "sum_fmt", "units_fmt", "share"]].rename(columns={
+            "sku_id": "SKU", "sku_name": "Товар",
+            "sum_fmt": "Стоимость", "units_fmt": "Остаток", "share": "Доля"
+        })
+        st.dataframe(wh_disp, use_container_width=True, height=320)
+    else:
+        st.info("Нет данных об остатках на складе")
+
+# ─────────────────────────────────────────────
+# LOCALIZATION
+# ─────────────────────────────────────────────
+st.markdown('<div class="section-title">📍 Уровень локализации</div>', unsafe_allow_html=True)
+st.caption(f"Доля присутствия товара на складах относительно {TOTAL_CLUSTERS} кластеров Ozon")
+
+if localization:
+    loc_df = pd.DataFrame(localization)
+    loc_df["pct"]     = (loc_df["clusters"] / TOTAL_CLUSTERS * 100).round(1)
+    loc_df["pct_fmt"] = loc_df["pct"].apply(lambda x: f"{x:.1f}%")
+    loc_df["bar"]     = loc_df["pct"].apply(lambda x:
+        "🟢" if x >= 80 else ("🟡" if x >= 50 else "🔴"))
+
+    # Plotly horizontal bar chart
+    fig_loc = go.Figure()
+    colors  = ["#059669" if p >= 80 else ("#f59e0b" if p >= 50 else "#ef4444")
+               for p in loc_df["pct"]]
+    fig_loc.add_trace(go.Bar(
+        y=loc_df["sku_name"],
+        x=loc_df["pct"],
+        orientation="h",
+        marker_color=colors,
+        text=loc_df["pct_fmt"],
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>%{x:.1f}% (%{customdata} кластеров)<extra></extra>",
+        customdata=loc_df["clusters"],
+    ))
+    no_legend = {k: v for k, v in THEME.items() if k != "legend"}
+    fig_loc.update_layout(
+        **no_legend,
+        height=max(300, len(loc_df) * 36),
+        xaxis=dict(range=[0, 110], ticksuffix="%", gridcolor="#eef0f8", zeroline=False,
+                   tickfont=dict(size=11, color="#8a98c0")),
+        yaxis=dict(tickfont=dict(size=11, color="#1a2040"), automargin=True),
+        shapes=[dict(type="line", x0=80, x1=80, y0=-0.5, y1=len(loc_df)-0.5,
+                     line=dict(color="#005bff", width=1, dash="dot"))],
+        annotations=[dict(x=81, y=len(loc_df)-0.5, text="цель 80%",
+                          showarrow=False, font=dict(size=10, color="#005bff"))],
+    )
+    st.markdown('<div class="chart-box">', unsafe_allow_html=True)
+    st.plotly_chart(fig_loc, use_container_width=True, config={"displayModeBar": False})
+    st.markdown('</div>', unsafe_allow_html=True)
+else:
+    st.info("Нет данных об уровне локализации")
 
 # ─────────────────────────────────────────────
 # FOOTER
