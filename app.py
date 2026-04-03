@@ -200,16 +200,22 @@ class OzonClient:
         return {"count": len(all_r), "sum": total_sum}
 
     def get_warehouse_stocks(self):
-        """POST /v3/product/info/stocks — остатки на складах FBO с ценами."""
+        """POST /v1/analytics/stock-on-warehouses — FBO остатки с ценами."""
         all_items, offset = [], 0
         while True:
-            payload = {"limit": 1000, "offset": offset}
-            r = self.session.post(f"{self.BASE_URL}/v3/product/info/stocks",
-                                  data=json.dumps(payload), timeout=30)
+            payload = {
+                "limit": 1000,
+                "offset": offset,
+                "warehouse_type": "ALL",
+            }
+            r = self.session.post(
+                f"{self.BASE_URL}/v1/analytics/stock-on-warehouses",
+                data=json.dumps(payload), timeout=30,
+            )
             if not r.ok:
                 break
-            data = r.json().get("result", {})
-            items = data.get("items", [])
+            data  = r.json().get("result", {})
+            items = data.get("rows", [])
             all_items.extend(items)
             if len(items) < 1000:
                 break
@@ -217,10 +223,13 @@ class OzonClient:
         return all_items
 
     def get_product_prices(self, product_ids: list):
-        """POST /v5/product/info/prices — цены товаров для расчёта капитализации."""
+        """POST /v5/product/info/prices — цены товаров."""
         if not product_ids:
             return []
-        payload = {"filter": {"product_id": product_ids[:1000]}, "limit": 1000, "offset": 0}
+        payload = {
+            "filter": {"product_id": [int(p) for p in product_ids[:1000] if str(p).isdigit()]},
+            "limit": 1000, "offset": 0,
+        }
         r = self.session.post(f"{self.BASE_URL}/v5/product/info/prices",
                               data=json.dumps(payload), timeout=30)
         if r.ok:
@@ -501,35 +510,47 @@ def load_real_returns(_cid, _key, df_str, dt_str):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_real_warehouse(_cid, _key):
-    """Загружает остатки FBO и считает капитализацию."""
+    """Загружает FBO остатки и считает капитализацию."""
     client = OzonClient(client_id=_cid, api_key=_key)
-    stocks = client.get_warehouse_stocks()
-    if not stocks:
+    rows = client.get_warehouse_stocks()
+    if not rows:
         return MOCK_WAREHOUSE
 
-    # Собираем product_id для запроса цен
-    product_ids = [str(item.get("product_id", "")) for item in stocks if item.get("product_id")]
-    prices_list = client.get_product_prices(product_ids[:1000])
+    # Агрегируем по SKU (один SKU может быть на нескольких складах)
+    sku_map: dict = {}
+    product_ids = set()
+    for row in rows:
+        sku_id   = str(row.get("sku", row.get("item_code", "")))
+        sku_name = row.get("item_name", sku_id)
+        units    = int(row.get("free_to_sell_amount", row.get("promised_amount", 0)) or 0)
+        pid      = str(row.get("product_id", ""))
+        if sku_id not in sku_map:
+            sku_map[sku_id] = {"sku_name": sku_name, "units": 0, "product_id": pid}
+        sku_map[sku_id]["units"] += units
+        if pid:
+            product_ids.add(pid)
+
+    # Цены
+    prices_list = client.get_product_prices(list(product_ids))
     price_map = {}
     for p in prices_list:
-        pid = str(p.get("product_id", ""))
+        pid   = str(p.get("product_id", ""))
         price = float(p.get("price", {}).get("price", 0) or 0)
-        price_map[pid] = price
+        if price:
+            price_map[pid] = price
 
     result_items, total_sum, total_units = [], 0.0, 0
-    for item in stocks:
-        pid  = str(item.get("product_id", ""))
-        name = item.get("name", pid)
-        sku  = str(item.get("offer_id", pid))
-        # суммируем FBO остатки по всем складам
-        fbo_stocks = item.get("stocks", [])
-        units = sum(int(s.get("present", 0)) for s in fbo_stocks if s.get("type") == "fbo")
-        price = price_map.get(pid, 0.0)
+    for sku_id, info in sku_map.items():
+        units = info["units"]
+        price = price_map.get(info["product_id"], 0.0)
         item_sum = units * price
         total_sum   += item_sum
         total_units += units
         if units > 0:
-            result_items.append({"sku_id": sku, "sku_name": name, "units": units, "sum": item_sum})
+            result_items.append({
+                "sku_id": sku_id, "sku_name": info["sku_name"],
+                "units": units, "sum": item_sum,
+            })
 
     result_items.sort(key=lambda x: x["sum"], reverse=True)
     return {"total_sum": total_sum, "total_units": total_units, "items": result_items[:50]}
@@ -760,7 +781,7 @@ total_views      = int(df_kpi["hits_view"].sum())
 revenue_delivered = float((df_kpi["revenue"] * df_kpi["delivered_units"] /
                            df_kpi["ordered_units"].replace(0, 1)).sum())
 
-cvr       = (total_orders / total_sessions * 100) if total_sessions else 0
+cvr       = (total_orders / total_views * 100) if total_views else 0
 avg_order = total_revenue / total_orders if total_orders else 0
 
 # Период для подписи карточек
@@ -892,10 +913,11 @@ with funnel_col:
 # TOP SKUs
 # ─────────────────────────────────────────────
 st.markdown('<div class="section-title">🏆 Топ-товары по продажам</div>', unsafe_allow_html=True)
+st.caption(f"За период {kpi_period}")
 
-group_cols = ["sku_id", "sku_name"] if "sku_name" in df.columns else ["sku_id"]
+group_cols = ["sku_id", "sku_name"] if "sku_name" in df_kpi.columns else ["sku_id"]
 top = (
-    df.groupby(group_cols)[METRIC_KEYS].sum().reset_index()
+    df_kpi.groupby(group_cols)[METRIC_KEYS].sum().reset_index()
     .sort_values("revenue", ascending=False).head(10).reset_index(drop=True)
 )
 top.index = top.index + 1
@@ -904,8 +926,9 @@ disp = top.copy()
 disp["revenue"]       = disp["revenue"].apply(lambda x: f"₽{x:,.0f}".replace(",", " "))
 disp["ordered_units"] = disp["ordered_units"].apply(lambda x: f"{int(x):,} шт".replace(",", " "))
 disp["hits_view"]     = disp["hits_view"].apply(lambda x: f"{int(x):,}".replace(",", " "))
-safe_s                = top["session_view"].replace(0, 1)
-disp["cvr"]           = (top["ordered_units"] / safe_s * 100).apply(lambda x: f"{x:.1f}%")
+# CVR = заказы / просмотры (hits_view), не session_view
+safe_v  = top["hits_view"].replace(0, 1)
+disp["cvr"] = (top["ordered_units"] / safe_v * 100).apply(lambda x: f"{x:.1f}%")
 
 rename = {"sku_id": "SKU ID", "sku_name": "Товар", "revenue": "Продажи",
           "ordered_units": "Заказов", "hits_view": "Просмотров", "cvr": "Конверсия"}
@@ -982,7 +1005,7 @@ if localization:
         hovertemplate="<b>%{y}</b><br>%{x:.1f}% (%{customdata} кластеров)<extra></extra>",
         customdata=loc_df["clusters"],
     ))
-    no_legend = {k: v for k, v in THEME.items() if k != "legend"}
+    no_legend = {k: v for k, v in THEME.items() if k not in ("legend", "xaxis", "yaxis")}
     fig_loc.update_layout(
         **no_legend,
         height=max(300, len(loc_df) * 36),
