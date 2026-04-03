@@ -147,21 +147,26 @@ class OzonClient:
         payload = {
             "date_from": date_from, "date_to": date_to,
             "metrics": metrics, "dimension": dimension,
-            "sort": [{"key": "revenue", "order": "DESC"}],
-            "limit": limit, "offset": 0,
+            "sort": [{"key": metrics[0], "order": "DESC"}],
+            "limit": min(limit, 1000), "offset": 0,
         }
         resp = self.session.post(f"{self.BASE_URL}/v1/analytics/data",
                                  data=json.dumps(payload), timeout=30)
+        if not resp.ok:
+            # Пробуем без сортировки
+            payload.pop("sort")
+            resp = self.session.post(f"{self.BASE_URL}/v1/analytics/data",
+                                     data=json.dumps(payload), timeout=30)
         resp.raise_for_status()
         return resp.json()
 
     def get_finance_totals(self):
         """POST /v1/finance/balance — отчёт о балансе (Финансы → Баланс в ЛК).
-        Требует date_from и date_to в формате YYYY-MM-DD, период макс. 30 дней.
+        Формат дат: YYYY-MM-DDThh:mm:ssZ, период макс. 30 дней.
         """
         now = datetime.now()
-        date_to   = now.strftime("%Y-%m-%d")
-        date_from = (now - timedelta(days=29)).strftime("%Y-%m-%d")
+        date_to   = now.strftime("%Y-%m-%dT23:59:59Z")
+        date_from = (now - timedelta(days=29)).strftime("%Y-%m-%dT00:00:00Z")
         payload = {
             "date_from": date_from,
             "date_to":   date_to,
@@ -198,7 +203,7 @@ class OzonClient:
 # ─────────────────────────────────────────────
 # DATA TRANSFORMATION
 # ─────────────────────────────────────────────
-METRIC_KEYS = ["revenue", "ordered_units", "hits_view", "session_view"]
+METRIC_KEYS = ["revenue", "ordered_units", "delivered_units", "hits_view", "session_view"]
 
 
 def _is_date(s: str) -> bool:
@@ -338,24 +343,68 @@ def funnel_chart(df_daily: pd.DataFrame) -> go.Figure:
 
 
 # ─────────────────────────────────────────────
+# КОНФИГ — сохранение ключей между сессиями
+# ─────────────────────────────────────────────
+import os
+
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ozon_config")
+
+def load_config() -> dict:
+    """Загружает сохранённые ключи из файла конфига."""
+    cfg = {"client_id": "", "api_key": ""}
+    # 1. Проверяем переменные окружения (Railway / .env)
+    cfg["client_id"] = os.environ.get("OZON_CLIENT_ID", "")
+    cfg["api_key"]   = os.environ.get("OZON_API_KEY", "")
+    # 2. Если нет в env — читаем из локального файла
+    if not cfg["client_id"] and os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        cfg[k.strip()] = v.strip()
+        except Exception:
+            pass
+    return cfg
+
+def save_config(client_id: str, api_key: str):
+    """Сохраняет ключи в локальный файл (только если не Railway)."""
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        return  # на Railway не пишем файл — там env vars
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            f.write(f"client_id={client_id}\n")
+            f.write(f"api_key={api_key}\n")
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────
 # SESSION STATE — настройки
 # ─────────────────────────────────────────────
+_cfg = load_config()
+
 if "client_id" not in st.session_state:
-    st.session_state.client_id = ""
+    st.session_state.client_id = _cfg["client_id"]
 if "api_key" not in st.session_state:
-    st.session_state.api_key = ""
+    st.session_state.api_key = _cfg["api_key"]
 if "date_from" not in st.session_state:
     st.session_state.date_from = date.today() - timedelta(days=29)
 if "date_to" not in st.session_state:
     st.session_state.date_to = date.today()
+if "kpi_date_from" not in st.session_state:
+    st.session_state.kpi_date_from = date.today() - timedelta(days=29)
+if "kpi_date_to" not in st.session_state:
+    st.session_state.kpi_date_to = date.today()
 
 # ─────────────────────────────────────────────
 # DATA LOADING
 # ─────────────────────────────────────────────
-client_id = st.session_state.client_id
-api_key   = st.session_state.api_key
-date_from = st.session_state.date_from
-date_to   = st.session_state.date_to
+client_id    = st.session_state.client_id
+api_key      = st.session_state.api_key
+date_from    = st.session_state.date_from
+date_to      = st.session_state.date_to
+kpi_date_from = st.session_state.kpi_date_from
+kpi_date_to   = st.session_state.kpi_date_to
 USE_MOCK  = not (client_id.strip() and api_key.strip())
 fetch_btn = False   # будет переопределён в панели настроек если она открыта
 
@@ -396,7 +445,6 @@ def load_mock_data(df, dt):
 
 if "df" not in st.session_state or fetch_btn:
     if fetch_btn:
-        # Сбрасываем кэш чтобы получить свежие данные
         load_real_data.clear()
         load_real_balance.clear()
         load_real_returns.clear()
@@ -405,13 +453,18 @@ if "df" not in st.session_state or fetch_btn:
         try:
             if USE_MOCK:
                 st.session_state.df      = load_mock_data(date_from, date_to)
+                st.session_state.df_kpi  = load_mock_data(kpi_date_from, kpi_date_to)
                 st.session_state.balance = MOCK_BALANCE
+                st.session_state.balance_raw = {}
                 st.session_state.returns = MOCK_RETURNS
                 st.session_state.data_error = None
             else:
-                df_str = date_from.strftime("%Y-%m-%d")
-                dt_str = date_to.strftime("%Y-%m-%d")
-                st.session_state.df = load_real_data(client_id, api_key, df_str, dt_str)
+                df_str  = date_from.strftime("%Y-%m-%d")
+                dt_str  = date_to.strftime("%Y-%m-%d")
+                kdf_str = kpi_date_from.strftime("%Y-%m-%d")
+                kdt_str = kpi_date_to.strftime("%Y-%m-%d")
+                st.session_state.df     = load_real_data(client_id, api_key, df_str, dt_str)
+                st.session_state.df_kpi = load_real_data(client_id, api_key, kdf_str, kdt_str)
                 try:
                     bal_result = load_real_balance(client_id, api_key)
                     st.session_state.balance     = bal_result[0]
@@ -420,24 +473,29 @@ if "df" not in st.session_state or fetch_btn:
                     st.session_state.balance     = MOCK_BALANCE
                     st.session_state.balance_raw = {}
                 try:
-                    st.session_state.returns = load_real_returns(client_id, api_key, df_str, dt_str)
+                    st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
                 except Exception:
                     st.session_state.returns = MOCK_RETURNS
                 st.session_state.data_error = None
         except Exception as e:
             st.session_state.data_error = str(e)
             st.session_state.df      = load_mock_data(date_from, date_to)
+            st.session_state.df_kpi  = load_mock_data(kpi_date_from, kpi_date_to)
             st.session_state.balance = MOCK_BALANCE
+            st.session_state.balance_raw = {}
             st.session_state.returns = MOCK_RETURNS
             USE_MOCK = True
 
-df: pd.DataFrame = st.session_state.df
-balance: float   = st.session_state.get("balance", MOCK_BALANCE)
-returns: dict    = st.session_state.get("returns", MOCK_RETURNS)
+df: pd.DataFrame     = st.session_state.df
+df_kpi: pd.DataFrame = st.session_state.get("df_kpi", st.session_state.df)
+balance: float       = st.session_state.get("balance", MOCK_BALANCE)
+returns: dict        = st.session_state.get("returns", MOCK_RETURNS)
 
 for col in METRIC_KEYS:
     if col not in df.columns:
         df[col] = 0.0
+    if col not in df_kpi.columns:
+        df_kpi[col] = 0.0
 
 # ─────────────────────────────────────────────
 # MAIN — HEADER
@@ -478,21 +536,26 @@ if st.session_state.get("show_settings", False):
                                        type="password", key="inp_key")
 
     with cfg2:
-        st.markdown("**📅 Период**")
-        new_date_from = st.date_input("Дата от", value=st.session_state.date_from, key="inp_df")
-        new_date_to   = st.date_input("Дата до", value=st.session_state.date_to,   key="inp_dt")
+        st.markdown("**📅 Период — KPI карточки**")
+        new_kpi_from = st.date_input("KPI от", value=st.session_state.kpi_date_from, key="inp_kf")
+        new_kpi_to   = st.date_input("KPI до", value=st.session_state.kpi_date_to,   key="inp_kt")
+        st.markdown("**📈 Период — График динамики**")
+        new_date_from = st.date_input("График от", value=st.session_state.date_from, key="inp_df")
+        new_date_to   = st.date_input("График до", value=st.session_state.date_to,   key="inp_dt")
 
     with cfg3:
         st.markdown("**▶ Действия**")
         st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
         if st.button("💾 Сохранить и закрыть", use_container_width=True, key="btn_save"):
-            st.session_state.client_id = new_client_id
-            st.session_state.api_key   = new_api_key
-            st.session_state.date_from = new_date_from
-            st.session_state.date_to   = new_date_to
+            st.session_state.client_id     = new_client_id
+            st.session_state.api_key       = new_api_key
+            st.session_state.date_from     = new_date_from
+            st.session_state.date_to       = new_date_to
+            st.session_state.kpi_date_from = new_kpi_from
+            st.session_state.kpi_date_to   = new_kpi_to
             st.session_state.show_settings = False
-            # Сбрасываем данные и кэш — следующий рендер загрузит с API
-            for _k in ["df", "balance", "returns", "data_error"]:
+            save_config(new_client_id, new_api_key)  # сохраняем на диск
+            for _k in ["df", "df_kpi", "balance", "returns", "data_error"]:
                 st.session_state.pop(_k, None)
             load_real_data.clear()
             load_real_balance.clear()
@@ -555,22 +618,28 @@ else:
             st.error(f"Последняя ошибка API: {st.session_state.data_error}")
 
 # ─────────────────────────────────────────────
-# AGGREGATES
+# AGGREGATES  (KPI период)
 # ─────────────────────────────────────────────
-total_revenue  = float(df["revenue"].sum())       # фактические продажи (выручка)
-total_orders   = int(df["ordered_units"].sum())    # заказы (ordered = оформленные)
-total_sessions = int(df["session_view"].sum())
-total_views    = int(df["hits_view"].sum())
+total_revenue    = float(df_kpi["revenue"].sum())
+total_orders     = int(df_kpi["ordered_units"].sum())
+total_delivered  = int(df_kpi["delivered_units"].sum())   # фактически доставленные
+total_sessions   = int(df_kpi["session_view"].sum())
+total_views      = int(df_kpi["hits_view"].sum())
 
-# «Продажи» — оплаченные заказы ≈ ordered_units (в аналитике Ozon это одно поле)
-# Конверсия = заказы / сессии
-cvr = (total_orders / total_sessions * 100) if total_sessions else 0
+# Выручка от доставленных (продажи за вычетом невыкупов)
+revenue_delivered = float((df_kpi["revenue"] * df_kpi["delivered_units"] /
+                           df_kpi["ordered_units"].replace(0, 1)).sum())
+
+cvr       = (total_orders / total_sessions * 100) if total_sessions else 0
 avg_order = total_revenue / total_orders if total_orders else 0
+
+# Период для подписи карточек
+kpi_period = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
 
 # ─────────────────────────────────────────────
 # KPI CARDS  (4 карточки)
 # ─────────────────────────────────────────────
-st.markdown('<div class="section-title">📊 Ключевые показатели</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="section-title">📊 Ключевые показатели · {kpi_period}</div>', unsafe_allow_html=True)
 
 c1, c2, c3, c4 = st.columns(4)
 
@@ -601,7 +670,7 @@ def single_card(col, css_cls, icon, label, main_val, delta, delta_cls="delta-neu
     """, unsafe_allow_html=True)
 
 
-# Карточка 1 — ЗАКАЗЫ: сумма / количество
+# Карточка 1 — ЗАКАЗЫ: выручка / количество оформленных
 dual_card(
     c1, "card-orders", "📦", "ЗАКАЗЫ",
     main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
@@ -610,12 +679,12 @@ dual_card(
     delta=f"Ср. чек ₽{avg_order:,.0f}".replace(",", " "),
 )
 
-# Карточка 2 — ПРОДАЖИ: сумма / кол-во оплаченных + конверсия
+# Карточка 2 — ПРОДАЖИ: выручка доставленных / кол-во доставленных + конверсия
 dual_card(
     c2, "card-sales", "💰", "ПРОДАЖИ",
-    main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
+    main_val=f"₽{revenue_delivered:,.0f}".replace(",", " "),
     sep="/",
-    sub_val=f"{total_orders:,} опл.".replace(",", " "),
+    sub_val=f"{total_delivered:,} опл.".replace(",", " "),
     delta=f"▲ Конверсия {cvr:.1f}%",
     delta_cls="delta-pos" if cvr > 2 else "delta-neu",
 )
@@ -645,7 +714,8 @@ dual_card(
 # ─────────────────────────────────────────────
 # CHARTS
 # ─────────────────────────────────────────────
-st.markdown('<div class="section-title">📈 Динамика</div>', unsafe_allow_html=True)
+chart_period = f"{date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m.%y')}"
+st.markdown(f'<div class="section-title">📈 Динамика · {chart_period}</div>', unsafe_allow_html=True)
 
 if "date" in df.columns:
     df_daily = df.groupby("date")[METRIC_KEYS].sum().reset_index().sort_values("date")
