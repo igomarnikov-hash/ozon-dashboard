@@ -269,7 +269,7 @@ class OzonClient:
 # ─────────────────────────────────────────────
 # DATA TRANSFORMATION
 # ─────────────────────────────────────────────
-METRIC_KEYS = ["revenue", "ordered_units", "delivered_units", "hits_view", "session_view"]
+METRIC_KEYS = ["revenue", "ordered_units", "hits_view", "session_view"]
 
 
 def _is_date(s: str) -> bool:
@@ -514,22 +514,13 @@ def load_real_data(_cid, _key, df_str, dt_str):
 def load_real_balance(_cid, _key):
     client = OzonClient(client_id=_cid, api_key=_key)
     data = client.get_finance_totals()
-    r = data.get("result", data)
 
-    # Пробуем все возможные поля где может лежать текущий баланс
-    # Диагностика покажет полный JSON — выберем нужное поле
-    balance = (
-        r.get("balance")               # /v1/finance/balance — основное поле
-        if isinstance(r.get("balance"), (int, float)) else None
-    ) or (
-        r.get("cash_flows", {}).get("balance")
-        if isinstance(r.get("cash_flows"), dict) else None
-    ) or r.get("end_balance") \
-      or r.get("current_balance") \
-      or r.get("available_for_payout") \
-      or 0
+    # Структура: { "total": { "closing_balance": { "value": 33693.79 } } }
+    total = data.get("total", {})
+    closing = total.get("closing_balance", {})
+    balance = float(closing.get("value", 0) or 0)
 
-    return float(balance or 0), data
+    return balance, data
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -803,18 +794,12 @@ else:
 # ─────────────────────────────────────────────
 total_revenue    = float(df_kpi["revenue"].sum())
 total_orders     = int(df_kpi["ordered_units"].sum())
-total_delivered  = int(df_kpi["delivered_units"].sum())   # фактически доставленные
 total_sessions   = int(df_kpi["session_view"].sum())
 total_views      = int(df_kpi["hits_view"].sum())
-
-# Выручка от доставленных (продажи за вычетом невыкупов)
-revenue_delivered = float((df_kpi["revenue"] * df_kpi["delivered_units"] /
-                           df_kpi["ordered_units"].replace(0, 1)).sum())
 
 cvr       = (total_orders / total_views * 100) if total_views else 0
 avg_order = total_revenue / total_orders if total_orders else 0
 
-# Период для подписи карточек
 kpi_period = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
 
 # ─────────────────────────────────────────────
@@ -882,13 +867,13 @@ dual_card(
     delta=f"Ср. чек ₽{avg_order:,.0f}".replace(",", " "),
 )
 
-# Карточка 2 — ПРОДАЖИ: выручка доставленных / кол-во доставленных + конверсия
+# Карточка 2 — ПРОДАЖИ: выручка / заказы + конверсия
 dual_card(
     c2, "card-sales", "💰", "ПРОДАЖИ",
-    main_val=f"₽{revenue_delivered:,.0f}".replace(",", " "),
+    main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
     sep="/",
-    sub_val=f"{total_delivered:,} опл.".replace(",", " "),
-    delta=f"▲ Конверсия {cvr:.1f}%",
+    sub_val=f"{total_orders:,} шт".replace(",", " "),
+    delta=f"▲ Конверсия {cvr:.1f}%" if cvr > 0 else "Нет данных о просмотрах",
     delta_cls="delta-pos" if cvr > 2 else "delta-neu",
 )
 
