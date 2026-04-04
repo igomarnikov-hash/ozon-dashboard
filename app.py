@@ -788,6 +788,28 @@ else:
             st.error(f"Ошибка запроса баланса: {_e}")
         if st.session_state.get("data_error"):
             st.error(f"Последняя ошибка API: {st.session_state.data_error}")
+        # Диагностика склада
+        st.markdown("**Склад warehouse (первые 2 строки):**")
+        wh_dbg = st.session_state.get("warehouse", {})
+        st.write(f"total_sum={wh_dbg.get('total_sum')}, items={len(wh_dbg.get('items',[]))}")
+        if wh_dbg.get("items"):
+            st.write(wh_dbg["items"][:2])
+        # Прямой запрос склада для диагностики
+        if not USE_MOCK:
+            try:
+                _c = OzonClient(client_id=client_id, api_key=api_key)
+                _raw_wh = _c.get_warehouse_stocks()
+                st.markdown(f"**Сырой ответ склада (первые 2 строки из {len(_raw_wh)}):**")
+                st.write(_raw_wh[:2] if _raw_wh else "Пусто — API вернул 0 строк")
+            except Exception as _e:
+                st.error(f"Ошибка склада: {_e}")
+            try:
+                _c2 = OzonClient(client_id=client_id, api_key=api_key)
+                _raw_loc = _c2.get_localization()
+                st.markdown(f"**Сырой ответ локализации (первые 2 строки из {len(_raw_loc)}):**")
+                st.write(_raw_loc[:2] if _raw_loc else "Пусто — API вернул 0 строк")
+            except Exception as _e:
+                st.error(f"Ошибка локализации: {_e}")
 
 # ─────────────────────────────────────────────
 # AGGREGATES  (KPI период)
@@ -808,7 +830,7 @@ kpi_period = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.
 # ─────────────────────────────────────────────
 # KPI DATE PICKER — inline прямо над карточками
 # ─────────────────────────────────────────────
-st.markdown('<div class="section-title">📊 Ключевые показатели</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="section-title">📊 Ключевые показатели · <span style="font-weight:400;color:#8a98c0">{kpi_period}</span></div>', unsafe_allow_html=True)
 
 dp_col1, dp_col2, dp_col3, dp_spacer = st.columns([1.5, 1.5, 1.5, 5])
 with dp_col1:
@@ -816,9 +838,10 @@ with dp_col1:
 with dp_col2:
     new_kpi_to = st.date_input("До", value=kpi_date_to, key="kpi_dp_to", label_visibility="collapsed")
 with dp_col3:
-    if st.button("Применить", key="kpi_apply", use_container_width=True):
+    if st.button("✓ Применить", key="kpi_apply", use_container_width=True):
         st.session_state.kpi_date_from = new_kpi_from
         st.session_state.kpi_date_to   = new_kpi_to
+        # Сбрасываем df_kpi чтобы принудительно перезагрузить
         for _k in ["df_kpi", "returns"]:
             st.session_state.pop(_k, None)
         load_real_data.clear()
@@ -828,6 +851,29 @@ with dp_col3:
 kpi_date_from = st.session_state.kpi_date_from
 kpi_date_to   = st.session_state.kpi_date_to
 kpi_period    = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
+
+# Перезагружаем df_kpi если он устарел
+if "df_kpi" not in st.session_state:
+    with st.spinner("Загрузка KPI…"):
+        try:
+            kdf_str = kpi_date_from.strftime("%Y-%m-%d")
+            kdt_str = kpi_date_to.strftime("%Y-%m-%d")
+            if USE_MOCK:
+                st.session_state.df_kpi = load_mock_data(kpi_date_from, kpi_date_to)
+            else:
+                st.session_state.df_kpi = load_real_data(client_id, api_key, kdf_str, kdt_str)
+            try:
+                st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
+            except Exception:
+                st.session_state.returns = MOCK_RETURNS
+        except Exception:
+            st.session_state.df_kpi = load_mock_data(kpi_date_from, kpi_date_to)
+
+df_kpi  = st.session_state.get("df_kpi", df)
+returns = st.session_state.get("returns", MOCK_RETURNS)
+for col in METRIC_KEYS:
+    if col not in df_kpi.columns:
+        df_kpi[col] = 0.0
 
 c1, c2, c3, c4 = st.columns(4)
 
