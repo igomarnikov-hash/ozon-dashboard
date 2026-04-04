@@ -221,27 +221,36 @@ class OzonClient:
         return {"count": len(all_r), "sum": total_sum}
 
     def get_warehouse_stocks(self):
-        """POST /v1/analytics/stock-on-warehouses — FBO остатки с ценами."""
-        all_items, offset = [], 0
+        """POST /v1/analytics/stock-on-warehouses — FBO остатки по складам."""
+        all_rows, offset = [], 0
         while True:
-            payload = {
-                "limit": 1000,
-                "offset": offset,
-                "warehouse_type": "ALL",
-            }
+            payload = {"limit": 1000, "offset": offset}
             r = self.session.post(
                 f"{self.BASE_URL}/v1/analytics/stock-on-warehouses",
                 data=json.dumps(payload), timeout=30,
             )
             if not r.ok:
+                # Пробуем альтернативный эндпоинт
+                r2 = self.session.post(
+                    f"{self.BASE_URL}/v2/analytics/stock-on-warehouses",
+                    data=json.dumps(payload), timeout=30,
+                )
+                if r2.ok:
+                    data = r2.json().get("result", {})
+                    rows = data.get("rows", [])
+                    all_rows.extend(rows)
+                    if len(rows) < 1000:
+                        break
+                    offset += 1000
+                    continue
                 break
-            data  = r.json().get("result", {})
-            items = data.get("rows", [])
-            all_items.extend(items)
-            if len(items) < 1000:
+            data = r.json().get("result", {})
+            rows = data.get("rows", [])
+            all_rows.extend(rows)
+            if len(rows) < 1000:
                 break
             offset += 1000
-        return all_items
+        return all_rows
 
     def get_product_prices(self, product_ids: list):
         """POST /v5/product/info/prices — цены товаров."""
@@ -258,11 +267,32 @@ class OzonClient:
         return []
 
     def get_localization(self):
-        """POST /v1/analytics/item-localization — уровень локализации по SKU."""
-        r = self.session.post(f"{self.BASE_URL}/v1/analytics/item-localization",
-                              data=json.dumps({"limit": 1000, "offset": 0}), timeout=30)
-        if r.ok:
-            return r.json().get("result", {}).get("items", [])
+        """Уровень локализации — пробуем несколько эндпоинтов."""
+        # Вариант 1: /v1/analytics/item-localization
+        for path, payload in [
+            ("/v1/analytics/item-localization",    {"limit": 1000, "offset": 0}),
+            ("/v1/rating/summary",                  {}),
+            ("/v1/analytics/data", {
+                "date_from": (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),
+                "date_to":   datetime.now().strftime("%Y-%m-%d"),
+                "metrics":   ["revenue"],
+                "dimension": ["sku"],
+                "limit": 1000, "offset": 0,
+            }),
+        ]:
+            try:
+                r = self.session.post(f"{self.BASE_URL}{path}",
+                                      data=json.dumps(payload), timeout=15)
+                if r.ok:
+                    data = r.json()
+                    # Ищем поле с локализацией
+                    items = (data.get("result", {}).get("items")
+                             or data.get("result", {}).get("data")
+                             or data.get("items", []))
+                    if items:
+                        return items
+            except Exception:
+                continue
         return []
 
 
@@ -788,28 +818,21 @@ else:
             st.error(f"Ошибка запроса баланса: {_e}")
         if st.session_state.get("data_error"):
             st.error(f"Последняя ошибка API: {st.session_state.data_error}")
-        # Диагностика склада
-        st.markdown("**Склад warehouse (первые 2 строки):**")
-        wh_dbg = st.session_state.get("warehouse", {})
-        st.write(f"total_sum={wh_dbg.get('total_sum')}, items={len(wh_dbg.get('items',[]))}")
-        if wh_dbg.get("items"):
-            st.write(wh_dbg["items"][:2])
-        # Прямой запрос склада для диагностики
         if not USE_MOCK:
+            st.markdown("**🏭 Сырой ответ склада:**")
             try:
                 _c = OzonClient(client_id=client_id, api_key=api_key)
-                _raw_wh = _c.get_warehouse_stocks()
-                st.markdown(f"**Сырой ответ склада (первые 2 строки из {len(_raw_wh)}):**")
-                st.write(_raw_wh[:2] if _raw_wh else "Пусто — API вернул 0 строк")
+                # Показываем сырой ответ без парсинга
+                _r = _c.session.post(
+                    f"{_c.BASE_URL}/v1/analytics/stock-on-warehouses",
+                    data=json.dumps({"limit": 3, "offset": 0}), timeout=15)
+                st.write(f"Status: {_r.status_code}")
+                if _r.ok:
+                    st.json(_r.json())
+                else:
+                    st.error(_r.text[:300])
             except Exception as _e:
-                st.error(f"Ошибка склада: {_e}")
-            try:
-                _c2 = OzonClient(client_id=client_id, api_key=api_key)
-                _raw_loc = _c2.get_localization()
-                st.markdown(f"**Сырой ответ локализации (первые 2 строки из {len(_raw_loc)}):**")
-                st.write(_raw_loc[:2] if _raw_loc else "Пусто — API вернул 0 строк")
-            except Exception as _e:
-                st.error(f"Ошибка локализации: {_e}")
+                st.error(f"Ошибка: {_e}")
 
 # ─────────────────────────────────────────────
 # AGGREGATES  (KPI период)
