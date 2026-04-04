@@ -545,7 +545,7 @@ USE_MOCK  = not (client_id.strip() and api_key.strip())
 fetch_btn = False   # будет переопределён в панели настроек если она открыта
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_real_data(_cid, _key, df_str, dt_str):
     client = OzonClient(client_id=_cid, api_key=_key)
     resp = client.get_analytics_data(
@@ -632,7 +632,7 @@ if "df" not in st.session_state or fetch_btn:
         try:
             if USE_MOCK:
                 st.session_state.df           = load_mock_data(date_from, date_to)
-                st.session_state.df_kpi       = load_mock_data(kpi_date_from, kpi_date_to)
+                st.session_state.df_kpi       = st.session_state.df
                 st.session_state.balance      = MOCK_BALANCE
                 st.session_state.balance_raw  = {}
                 st.session_state.returns      = MOCK_RETURNS
@@ -644,15 +644,25 @@ if "df" not in st.session_state or fetch_btn:
                 dt_str  = date_to.strftime("%Y-%m-%d")
                 kdf_str = kpi_date_from.strftime("%Y-%m-%d")
                 kdt_str = kpi_date_to.strftime("%Y-%m-%d")
-                st.session_state.df     = load_real_data(client_id, api_key, df_str, dt_str)
-                st.session_state.df_kpi = load_real_data(client_id, api_key, kdf_str, kdt_str)
+
+                # Основные данные графика
+                st.session_state.df = load_real_data(client_id, api_key, df_str, dt_str)
+
+                # KPI данные — переиспользуем если период тот же
+                if kdf_str == df_str and kdt_str == dt_str:
+                    st.session_state.df_kpi = st.session_state.df
+                else:
+                    st.session_state.df_kpi = load_real_data(client_id, api_key, kdf_str, kdt_str)
+
+                # Баланс — независимый запрос
                 try:
                     bal_result = load_real_balance(client_id, api_key)
                     st.session_state.balance     = bal_result[0]
                     st.session_state.balance_raw = bal_result[1]
                 except Exception:
-                    st.session_state.balance     = MOCK_BALANCE
+                    st.session_state.balance     = 0.0
                     st.session_state.balance_raw = {}
+
                 try:
                     st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
                 except Exception:
@@ -669,8 +679,8 @@ if "df" not in st.session_state or fetch_btn:
         except Exception as e:
             st.session_state.data_error   = str(e)
             st.session_state.df           = load_mock_data(date_from, date_to)
-            st.session_state.df_kpi       = load_mock_data(kpi_date_from, kpi_date_to)
-            st.session_state.balance      = MOCK_BALANCE
+            st.session_state.df_kpi       = st.session_state.df
+            st.session_state.balance      = 0.0
             st.session_state.balance_raw  = {}
             st.session_state.returns      = MOCK_RETURNS
             st.session_state.warehouse    = MOCK_WAREHOUSE
@@ -851,22 +861,29 @@ kpi_date_from = st.session_state.kpi_date_from
 kpi_date_to   = st.session_state.kpi_date_to
 kpi_period    = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
 
-# Перезагружаем df_kpi если он устарел
+# Перезагружаем df_kpi только если нужно
 if "df_kpi" not in st.session_state:
-    with st.spinner("Загрузка KPI…"):
-        try:
-            kdf_str = kpi_date_from.strftime("%Y-%m-%d")
-            kdt_str = kpi_date_to.strftime("%Y-%m-%d")
-            if USE_MOCK:
-                st.session_state.df_kpi = load_mock_data(kpi_date_from, kpi_date_to)
-            else:
-                st.session_state.df_kpi = load_real_data(client_id, api_key, kdf_str, kdt_str)
+    kdf_str = kpi_date_from.strftime("%Y-%m-%d")
+    kdt_str = kpi_date_to.strftime("%Y-%m-%d")
+    df_str  = date_from.strftime("%Y-%m-%d")
+    dt_str  = date_to.strftime("%Y-%m-%d")
+    # Если периоды совпадают — не делаем лишний запрос
+    if kdf_str == df_str and kdt_str == dt_str:
+        st.session_state.df_kpi = st.session_state.df
+    else:
+        with st.spinner("Загрузка KPI…"):
             try:
-                st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
+                if USE_MOCK:
+                    st.session_state.df_kpi = load_mock_data(kpi_date_from, kpi_date_to)
+                else:
+                    st.session_state.df_kpi = load_real_data(client_id, api_key, kdf_str, kdt_str)
             except Exception:
-                st.session_state.returns = MOCK_RETURNS
-        except Exception:
-            st.session_state.df_kpi = load_mock_data(kpi_date_from, kpi_date_to)
+                st.session_state.df_kpi = st.session_state.df
+    try:
+        if not USE_MOCK:
+            st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
+    except Exception:
+        pass
 
 df_kpi  = st.session_state.get("df_kpi", df)
 returns = st.session_state.get("returns", MOCK_RETURNS)
