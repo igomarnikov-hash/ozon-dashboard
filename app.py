@@ -221,36 +221,58 @@ class OzonClient:
         return {"count": len(all_r), "sum": total_sum}
 
     def get_warehouse_stocks(self):
-        """POST /v1/analytics/stock-on-warehouses — FBO остатки по складам."""
-        all_rows, offset = [], 0
+        """Получает FBO остатки и цены для расчёта капитализации."""
+        # Шаг 1: получаем список товаров с остатками через /v3/product/info/stocks
+        all_items, offset = [], 0
         while True:
             payload = {"limit": 1000, "offset": offset}
-            r = self.session.post(
-                f"{self.BASE_URL}/v1/analytics/stock-on-warehouses",
-                data=json.dumps(payload), timeout=30,
-            )
+            r = self.session.post(f"{self.BASE_URL}/v3/product/info/stocks",
+                                  data=json.dumps(payload), timeout=30)
             if not r.ok:
-                # Пробуем альтернативный эндпоинт
-                r2 = self.session.post(
-                    f"{self.BASE_URL}/v2/analytics/stock-on-warehouses",
-                    data=json.dumps(payload), timeout=30,
-                )
-                if r2.ok:
-                    data = r2.json().get("result", {})
-                    rows = data.get("rows", [])
-                    all_rows.extend(rows)
-                    if len(rows) < 1000:
-                        break
-                    offset += 1000
-                    continue
                 break
-            data = r.json().get("result", {})
-            rows = data.get("rows", [])
-            all_rows.extend(rows)
-            if len(rows) < 1000:
+            result = r.json().get("result", {})
+            items  = result.get("items", [])
+            all_items.extend(items)
+            if len(items) < 1000:
                 break
             offset += 1000
-        return all_rows
+
+        if not all_items:
+            return []
+
+        # Шаг 2: получаем цены
+        product_ids = [item.get("product_id") for item in all_items if item.get("product_id")]
+        prices_resp = self.session.post(
+            f"{self.BASE_URL}/v5/product/info/prices",
+            data=json.dumps({"filter": {"product_id": product_ids[:1000]}, "limit": 1000, "offset": 0}),
+            timeout=30,
+        )
+        price_map = {}
+        if prices_resp.ok:
+            for p in prices_resp.json().get("result", {}).get("items", []):
+                pid   = str(p.get("product_id", ""))
+                price = float(p.get("price", {}).get("price", 0) or 0)
+                if price:
+                    price_map[pid] = price
+
+        # Шаг 3: формируем результат
+        rows = []
+        for item in all_items:
+            pid      = str(item.get("product_id", ""))
+            sku_id   = str(item.get("offer_id", pid))
+            sku_name = item.get("name", sku_id)
+            # FBO остатки — суммируем present по всем складам типа fbo
+            stocks = item.get("stocks", [])
+            units  = sum(int(s.get("present", 0))
+                         for s in stocks if s.get("type", "").lower() == "fbo")
+            if units > 0:
+                rows.append({
+                    "sku": sku_id, "item_name": sku_name,
+                    "free_to_sell_amount": units,
+                    "product_id": pid,
+                    "_price": price_map.get(pid, 0.0),
+                })
+        return rows
 
     def get_product_prices(self, product_ids: list):
         """POST /v5/product/info/prices — цены товаров."""
@@ -267,29 +289,22 @@ class OzonClient:
         return []
 
     def get_localization(self):
-        """Уровень локализации — пробуем несколько эндпоинтов."""
-        # Вариант 1: /v1/analytics/item-localization
+        """Уровень локализации через /v1/analytics/data с dimension sku + cluster."""
+        # Пробуем специальный эндпоинт локализации
         for path, payload in [
-            ("/v1/analytics/item-localization",    {"limit": 1000, "offset": 0}),
-            ("/v1/rating/summary",                  {}),
-            ("/v1/analytics/data", {
-                "date_from": (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),
-                "date_to":   datetime.now().strftime("%Y-%m-%d"),
-                "metrics":   ["revenue"],
-                "dimension": ["sku"],
-                "limit": 1000, "offset": 0,
-            }),
+            ("/v1/analytics/item-localization", {"limit": 1000, "offset": 0}),
+            ("/v1/product/list", {"filter": {}, "limit": 1000, "offset": 0}),
         ]:
             try:
                 r = self.session.post(f"{self.BASE_URL}{path}",
                                       data=json.dumps(payload), timeout=15)
                 if r.ok:
-                    data = r.json()
-                    # Ищем поле с локализацией
-                    items = (data.get("result", {}).get("items")
-                             or data.get("result", {}).get("data")
-                             or data.get("items", []))
-                    if items:
+                    data  = r.json()
+                    items = (data.get("result", {}).get("items") or
+                             data.get("result", {}).get("rows") or [])
+                    # Проверяем что есть поля локализации
+                    if items and any("cluster" in str(i).lower() or
+                                     "locali" in str(i).lower() for i in items[:3]):
                         return items
             except Exception:
                 continue
@@ -561,50 +576,26 @@ def load_real_returns(_cid, _key, df_str, dt_str):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_real_warehouse(_cid, _key):
-    """Загружает FBO остатки и считает капитализацию."""
     client = OzonClient(client_id=_cid, api_key=_key)
     rows = client.get_warehouse_stocks()
     if not rows:
         return MOCK_WAREHOUSE
 
-    # Агрегируем по SKU (один SKU может быть на нескольких складах)
-    sku_map: dict = {}
-    product_ids = set()
-    for row in rows:
-        sku_id   = str(row.get("sku", row.get("item_code", "")))
-        sku_name = row.get("item_name", sku_id)
-        units    = int(row.get("free_to_sell_amount", row.get("promised_amount", 0)) or 0)
-        pid      = str(row.get("product_id", ""))
-        if sku_id not in sku_map:
-            sku_map[sku_id] = {"sku_name": sku_name, "units": 0, "product_id": pid}
-        sku_map[sku_id]["units"] += units
-        if pid:
-            product_ids.add(pid)
-
-    # Цены
-    prices_list = client.get_product_prices(list(product_ids))
-    price_map = {}
-    for p in prices_list:
-        pid   = str(p.get("product_id", ""))
-        price = float(p.get("price", {}).get("price", 0) or 0)
-        if price:
-            price_map[pid] = price
-
     result_items, total_sum, total_units = [], 0.0, 0
-    for sku_id, info in sku_map.items():
-        units = info["units"]
-        price = price_map.get(info["product_id"], 0.0)
+    for row in rows:
+        sku_id   = str(row.get("sku", row.get("offer_id", "")))
+        sku_name = row.get("item_name", sku_id)
+        units    = int(row.get("free_to_sell_amount", 0))
+        price    = float(row.get("_price", 0.0))
         item_sum = units * price
         total_sum   += item_sum
         total_units += units
-        if units > 0:
-            result_items.append({
-                "sku_id": sku_id, "sku_name": info["sku_name"],
-                "units": units, "sum": item_sum,
-            })
+        result_items.append({"sku_id": sku_id, "sku_name": sku_name,
+                              "units": units, "sum": item_sum})
 
     result_items.sort(key=lambda x: x["sum"], reverse=True)
-    return {"total_sum": total_sum, "total_units": total_units, "items": result_items[:50]}
+    return {"total_sum": total_sum, "total_units": total_units,
+            "items": result_items[:50]}
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -818,21 +809,6 @@ else:
             st.error(f"Ошибка запроса баланса: {_e}")
         if st.session_state.get("data_error"):
             st.error(f"Последняя ошибка API: {st.session_state.data_error}")
-        if not USE_MOCK:
-            st.markdown("**🏭 Сырой ответ склада:**")
-            try:
-                _c = OzonClient(client_id=client_id, api_key=api_key)
-                # Показываем сырой ответ без парсинга
-                _r = _c.session.post(
-                    f"{_c.BASE_URL}/v1/analytics/stock-on-warehouses",
-                    data=json.dumps({"limit": 3, "offset": 0}), timeout=15)
-                st.write(f"Status: {_r.status_code}")
-                if _r.ok:
-                    st.json(_r.json())
-                else:
-                    st.error(_r.text[:300])
-            except Exception as _e:
-                st.error(f"Ошибка: {_e}")
 
 # ─────────────────────────────────────────────
 # AGGREGATES  (KPI период)
@@ -1106,6 +1082,115 @@ if localization:
     st.markdown('</div>', unsafe_allow_html=True)
 else:
     st.info("Нет данных об уровне локализации")
+
+# ─────────────────────────────────────────────
+# ФИНАНСЫ — детализация затрат
+# ─────────────────────────────────────────────
+st.markdown('<div class="section-title">💳 Финансы · детализация затрат</div>',
+            unsafe_allow_html=True)
+
+# Кнопка переключения
+if "show_finance" not in st.session_state:
+    st.session_state.show_finance = False
+
+fin_col1, fin_col2 = st.columns([2, 8])
+with fin_col1:
+    if st.button("📊 Показать / скрыть", key="fin_toggle", use_container_width=True):
+        st.session_state.show_finance = not st.session_state.show_finance
+
+if st.session_state.show_finance:
+    bal_raw = st.session_state.get("balance_raw", {})
+    total_r = bal_raw.get("total", {})
+    cf      = bal_raw.get("cashflows", {})
+    services = bal_raw.get("services", [])
+
+    if not total_r and USE_MOCK:
+        st.info("⚠ В демо-режиме финансовая детализация недоступна. Подключите API.")
+    else:
+        # ── Сводка ──
+        opening = float((total_r.get("opening_balance") or {}).get("value", 0))
+        closing = float((total_r.get("closing_balance") or {}).get("value", 0))
+        accrued = float((total_r.get("accrued") or {}).get("value", 0))
+
+        sales_cf = cf.get("sales", {})
+        sales_amt = float((sales_cf.get("amount") or {}).get("value", 0))
+        sales_fee = float((sales_cf.get("fee") or {}).get("value", 0))
+
+        ret_cf  = cf.get("returns", {})
+        ret_amt = float((ret_cf.get("amount") or {}).get("value", 0))
+
+        # ── KPI строка финансов ──
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        def fin_card(col, label, value, cls="delta-neu"):
+            col.markdown(f"""
+                <div class="metric-card" style="border-top:3px solid #{'005bff' if cls=='delta-pos' else ('e53e3e' if cls=='delta-neg' else '8a98c0')}">
+                  <div class="metric-label">{label}</div>
+                  <div class="metric-main">{'₽' + f'{abs(value):,.0f}'.replace(',', ' ')}</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        fin_card(fc1, "💰 Начислено за продажи", sales_amt, "delta-pos")
+        fin_card(fc2, "📦 Комиссия Ozon",         abs(sales_fee), "delta-neg")
+        fin_card(fc3, "↩️ Возвраты",               abs(ret_amt),  "delta-neg")
+        fin_card(fc4, "🏦 Баланс на конец",        closing,       "delta-pos")
+
+        # ── Детализация услуг ──
+        if services:
+            st.markdown("""<div style="font-size:11px;font-weight:600;color:#7a88b8;
+                letter-spacing:.08em;text-transform:uppercase;margin:20px 0 8px">
+                Детализация услуг</div>""", unsafe_allow_html=True)
+
+            SERVICE_NAMES = {
+                "goods_shelf_life_processing": "Обработка срока годности",
+                "reverse_logistics":           "Обратная логистика",
+                "promotion_with_cost_per_order": "Продвижение (за заказ)",
+                "cross_docking":               "Кросс-докинг",
+                "points_for_reviews":          "Баллы за отзывы",
+                "pay_per_click":               "Реклама (клики)",
+                "acquiring":                   "Эквайринг",
+                "brand_promotion":             "Продвижение бренда",
+                "seller_bonuses":              "Бонусы продавца",
+                "logistics":                   "Логистика",
+                "courier_client_reinvoice":    "Курьерская доставка",
+            }
+            svc_rows = []
+            for svc in services:
+                name = svc.get("name", "")
+                amt  = float((svc.get("amount") or {}).get("value", 0))
+                svc_rows.append({
+                    "Услуга": SERVICE_NAMES.get(name, name),
+                    "Сумма":  f"₽{amt:,.2f}".replace(",", " "),
+                    "_val":   amt,
+                })
+            svc_rows.sort(key=lambda x: x["_val"])
+
+            # Горизонтальный бар-чарт услуг
+            svc_df = pd.DataFrame(svc_rows)
+            fig_svc = go.Figure(go.Bar(
+                y=svc_df["Услуга"],
+                x=svc_df["_val"].abs(),
+                orientation="h",
+                marker_color=["#ef4444" if v < 0 else "#059669" for v in svc_df["_val"]],
+                text=svc_df["Сумма"],
+                textposition="outside",
+                hovertemplate="<b>%{y}</b><br>%{text}<extra></extra>",
+            ))
+            no_leg = {k: v for k, v in THEME.items() if k not in ("legend", "xaxis", "yaxis")}
+            fig_svc.update_layout(
+                **no_leg,
+                height=max(250, len(svc_df) * 34),
+                xaxis=dict(gridcolor="#eef0f8", zeroline=False,
+                           tickfont=dict(size=11, color="#8a98c0")),
+                yaxis=dict(tickfont=dict(size=11, color="#1a2040"), automargin=True),
+            )
+            st.markdown('<div class="chart-box">', unsafe_allow_html=True)
+            st.plotly_chart(fig_svc, use_container_width=True, config={"displayModeBar": False})
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # Период финансов
+            payload_sent = bal_raw.get("_payload_sent", {})
+            if payload_sent:
+                st.caption(f"Период: {payload_sent.get('date_from', '')} — {payload_sent.get('date_to', '')}")
 
 # ─────────────────────────────────────────────
 # FOOTER
