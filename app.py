@@ -161,24 +161,45 @@ class OzonClient:
         return resp.json()
 
     def get_finance_totals(self):
-        """POST /v1/finance/balance — отчёт о балансе (Финансы → Баланс в ЛК).
-        Формат дат: YYYY-MM-DDThh:mm:ssZ, период макс. 30 дней.
+        """POST /v1/finance/balance — текущий баланс (Финансы → Баланс в ЛК).
+        Пробуем несколько вариантов формата дат.
         """
         now = datetime.now()
-        date_to   = now.strftime("%Y-%m-%dT23:59:59Z")
-        date_from = (now - timedelta(days=29)).strftime("%Y-%m-%dT00:00:00Z")
+        # Вариант 1: ISO datetime с Z
+        for date_fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+            try:
+                payload = {
+                    "date_from": (now - timedelta(days=1)).strftime(date_fmt.replace("T%H:%M:%SZ", "T00:00:00Z").replace("%Y-%m-%d", "%Y-%m-%d")),
+                    "date_to":   now.strftime(date_fmt.replace("T%H:%M:%SZ", "T23:59:59Z").replace("%Y-%m-%d", "%Y-%m-%d")),
+                }
+                resp = self.session.post(
+                    f"{self.BASE_URL}/v1/finance/balance",
+                    data=json.dumps(payload), timeout=15,
+                )
+                if resp.ok:
+                    data = resp.json()
+                    data["_endpoint_used"] = "/v1/finance/balance"
+                    data["_payload_sent"]  = payload
+                    return data
+            except Exception:
+                continue
+
+        # Fallback: transaction totals
+        now = datetime.now()
         payload = {
-            "date_from": date_from,
-            "date_to":   date_to,
+            "date": {
+                "from": now.replace(day=1).strftime("%Y-%m-%dT00:00:00.000Z"),
+                "to":   now.strftime("%Y-%m-%dT23:59:59.000Z"),
+            },
+            "transaction_type": "all",
         }
-        resp = self.session.post(
-            f"{self.BASE_URL}/v1/finance/balance",
-            data=json.dumps(payload), timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        data["_endpoint_used"] = "/v1/finance/balance"
-        return data
+        resp = self.session.post(f"{self.BASE_URL}/v3/finance/transaction/totals",
+                                 data=json.dumps(payload), timeout=15)
+        if resp.ok:
+            data = resp.json()
+            data["_endpoint_used"] = "/v3/finance/transaction/totals (fallback)"
+            return data
+        raise RuntimeError("Все финансовые эндпоинты вернули ошибку")
 
     def get_returns(self, date_from: str, date_to: str, limit: int = 1000):
         """POST /v3/returns/company/fbo + fbs — возвраты (сумма и кол-во)"""
@@ -494,12 +515,21 @@ def load_real_balance(_cid, _key):
     client = OzonClient(client_id=_cid, api_key=_key)
     data = client.get_finance_totals()
     r = data.get("result", data)
-    # /v1/finance/balance — структура ответа содержит balance и credit
-    # balance = собственные средства, credit = кредит Ozon
-    own     = float(r.get("balance", 0) or 0)
-    credit  = float(r.get("credit",  0) or 0)
-    total   = float(r.get("total_balance", own + credit) or own + credit)
-    return total, data
+
+    # Пробуем все возможные поля где может лежать текущий баланс
+    # Диагностика покажет полный JSON — выберем нужное поле
+    balance = (
+        r.get("balance")               # /v1/finance/balance — основное поле
+        if isinstance(r.get("balance"), (int, float)) else None
+    ) or (
+        r.get("cash_flows", {}).get("balance")
+        if isinstance(r.get("cash_flows"), dict) else None
+    ) or r.get("end_balance") \
+      or r.get("current_balance") \
+      or r.get("available_for_payout") \
+      or 0
+
+    return float(balance or 0), data
 
 
 @st.cache_data(ttl=300, show_spinner=False)
