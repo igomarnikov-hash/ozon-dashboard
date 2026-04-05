@@ -954,37 +954,63 @@ with dp_col3:
         load_real_sales_data.clear()
         load_real_returns.clear()
         st.rerun()
-
 kpi_date_from = st.session_state.kpi_date_from
 kpi_date_to   = st.session_state.kpi_date_to
 kpi_period    = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
 
-# Перезагружаем df_kpi только если нужно
-if "df_kpi" not in st.session_state:
+# Перезагружаем df_kpi и df_sales если нужно
+if "df_kpi" not in st.session_state or "df_sales" not in st.session_state:
     kdf_str = kpi_date_from.strftime("%Y-%m-%d")
     kdt_str = kpi_date_to.strftime("%Y-%m-%d")
     df_str  = date_from.strftime("%Y-%m-%d")
     dt_str  = date_to.strftime("%Y-%m-%d")
-    # Если периоды совпадают — не делаем лишний запрос
-    if kdf_str == df_str and kdt_str == dt_str:
-        st.session_state.df_kpi = st.session_state.df
-    else:
-        with st.spinner("Загрузка KPI…"):
+    with st.spinner("Загрузка KPI…"):
+        # df_kpi
+        if "df_kpi" not in st.session_state:
+            if kdf_str == df_str and kdt_str == dt_str:
+                st.session_state.df_kpi = st.session_state.df
+            else:
+                try:
+                    if USE_MOCK:
+                        st.session_state.df_kpi = load_mock_data(kpi_date_from, kpi_date_to)
+                    else:
+                        st.session_state.df_kpi = load_real_data(client_id, api_key, kdf_str, kdt_str)
+                except Exception:
+                    st.session_state.df_kpi = st.session_state.df
+        # df_sales — всегда загружаем за KPI период (день без SKU)
+        if "df_sales" not in st.session_state:
             try:
                 if USE_MOCK:
-                    st.session_state.df_kpi = load_mock_data(kpi_date_from, kpi_date_to)
+                    st.session_state.df_sales = st.session_state.df
                 else:
-                    st.session_state.df_kpi = load_real_data(client_id, api_key, kdf_str, kdt_str)
+                    st.session_state.df_sales = load_real_sales_data(client_id, api_key, kdf_str, kdt_str)
             except Exception:
-                st.session_state.df_kpi = st.session_state.df
-    try:
-        if not USE_MOCK:
-            st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
-    except Exception:
-        pass
+                st.session_state.df_sales = pd.DataFrame()
+        # returns
+        try:
+            if not USE_MOCK and "returns" not in st.session_state:
+                st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
+        except Exception:
+            pass
+        # warehouse и localization — если ещё не загружены
+        if "warehouse" not in st.session_state or st.session_state.warehouse == MOCK_WAREHOUSE:
+            try:
+                if not USE_MOCK:
+                    st.session_state.warehouse = load_real_warehouse(client_id, api_key)
+            except Exception:
+                pass
+        if "localization" not in st.session_state or st.session_state.localization == MOCK_LOCALIZATION:
+            try:
+                if not USE_MOCK:
+                    st.session_state.localization = load_real_localization(client_id, api_key)
+            except Exception:
+                pass
 
-df_kpi  = st.session_state.get("df_kpi", df)
-returns = st.session_state.get("returns", MOCK_RETURNS)
+df_kpi   = st.session_state.get("df_kpi", df)
+df_sales = st.session_state.get("df_sales", pd.DataFrame())
+returns  = st.session_state.get("returns", MOCK_RETURNS)
+warehouse    = st.session_state.get("warehouse", MOCK_WAREHOUSE)
+localization = st.session_state.get("localization", MOCK_LOCALIZATION)
 for col in METRIC_KEYS:
     if col not in df_kpi.columns:
         df_kpi[col] = 0.0
@@ -1126,6 +1152,15 @@ st.dataframe(disp[show_cols], use_container_width=True, height=380)
 # ─────────────────────────────────────────────
 st.markdown('<div class="section-title">🏭 Капитализация складов</div>', unsafe_allow_html=True)
 
+# Если данные mock — пробуем загрузить реальные прямо сейчас
+if warehouse == MOCK_WAREHOUSE and not USE_MOCK:
+    with st.spinner("Загрузка остатков склада…"):
+        try:
+            warehouse = load_real_warehouse(client_id, api_key)
+            st.session_state.warehouse = warehouse
+        except Exception as _wh_e:
+            st.warning(f"Не удалось загрузить склад: {_wh_e}")
+
 wh_sum   = warehouse.get("total_sum", 0)
 wh_units = warehouse.get("total_units", 0)
 wh_items = warehouse.get("items", [])
@@ -1208,58 +1243,6 @@ if localization:
 else:
     st.info("Нет данных об уровне локализации")
 
-# ─────────────────────────────────────────────
-# ФИНАНСЫ — детализация затрат
-# ─────────────────────────────────────────────
-st.markdown('<div class="section-title">💳 Финансы · детализация затрат</div>',
-            unsafe_allow_html=True)
-
-# Кнопка переключения
-if "show_finance" not in st.session_state:
-    st.session_state.show_finance = False
-
-fin_col1, fin_col2 = st.columns([2, 8])
-with fin_col1:
-    if st.button("📊 Показать / скрыть", key="fin_toggle", use_container_width=True):
-        st.session_state.show_finance = not st.session_state.show_finance
-
-if st.session_state.show_finance:
-    bal_raw = st.session_state.get("balance_raw", {})
-    total_r = bal_raw.get("total", {})
-    cf      = bal_raw.get("cashflows", {})
-    services = bal_raw.get("services", [])
-
-    if not total_r and USE_MOCK:
-        st.info("⚠ В демо-режиме финансовая детализация недоступна. Подключите API.")
-    else:
-        # ── Сводка ──
-        opening = float((total_r.get("opening_balance") or {}).get("value", 0))
-        closing = float((total_r.get("closing_balance") or {}).get("value", 0))
-        accrued = float((total_r.get("accrued") or {}).get("value", 0))
-
-        sales_cf = cf.get("sales", {})
-        sales_amt = float((sales_cf.get("amount") or {}).get("value", 0))
-        sales_fee = float((sales_cf.get("fee") or {}).get("value", 0))
-
-        ret_cf  = cf.get("returns", {})
-        ret_amt = float((ret_cf.get("amount") or {}).get("value", 0))
-
-        # ── KPI строка финансов ──
-        fc1, fc2, fc3, fc4 = st.columns(4)
-        def fin_card(col, label, value, cls="delta-neu"):
-            col.markdown(f"""
-                <div class="metric-card" style="border-top:3px solid #{'005bff' if cls=='delta-pos' else ('e53e3e' if cls=='delta-neg' else '8a98c0')}">
-                  <div class="metric-label">{label}</div>
-                  <div class="metric-main">{'₽' + f'{abs(value):,.0f}'.replace(',', ' ')}</div>
-                </div>
-            """, unsafe_allow_html=True)
-
-        fin_card(fc1, "💰 Начислено за продажи", sales_amt, "delta-pos")
-        fin_card(fc2, "📦 Комиссия Ozon",         abs(sales_fee), "delta-neg")
-        fin_card(fc3, "↩️ Возвраты",               abs(ret_amt),  "delta-neg")
-        fin_card(fc4, "🏦 Баланс на конец",        closing,       "delta-pos")
-
-        # ── Детализация услуг ──
 # ─────────────────────────────────────────────
 # FOOTER
 # ─────────────────────────────────────────────
