@@ -314,7 +314,8 @@ class OzonClient:
 # ─────────────────────────────────────────────
 # DATA TRANSFORMATION
 # ─────────────────────────────────────────────
-METRIC_KEYS = ["revenue", "ordered_units", "hits_view", "session_view"]
+METRIC_KEYS       = ["revenue", "ordered_units", "hits_view", "session_view"]
+SALES_METRIC_KEYS = ["revenue", "ordered_units", "delivered_units", "hits_view", "session_view"]
 
 
 def _is_date(s: str) -> bool:
@@ -555,6 +556,17 @@ def load_real_data(_cid, _key, df_str, dt_str):
     return parse_analytics_response(resp)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_real_sales_data(_cid, _key, df_str, dt_str):
+    """Загружает данные по дням (без sku) — включает delivered_units."""
+    client = OzonClient(client_id=_cid, api_key=_key)
+    resp = client.get_analytics_data(
+        date_from=df_str, date_to=dt_str,
+        metrics=SALES_METRIC_KEYS, dimension=["day"],
+    )
+    return parse_analytics_response(resp)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_real_balance(_cid, _key):
     client = OzonClient(client_id=_cid, api_key=_key)
@@ -623,6 +635,7 @@ def load_mock_data(df, dt):
 if "df" not in st.session_state or fetch_btn:
     if fetch_btn:
         load_real_data.clear()
+        load_real_sales_data.clear()
         load_real_balance.clear()
         load_real_returns.clear()
         load_real_warehouse.clear()
@@ -633,6 +646,7 @@ if "df" not in st.session_state or fetch_btn:
             if USE_MOCK:
                 st.session_state.df           = load_mock_data(date_from, date_to)
                 st.session_state.df_kpi       = st.session_state.df
+                st.session_state.df_sales     = st.session_state.df
                 st.session_state.balance      = MOCK_BALANCE
                 st.session_state.balance_raw  = {}
                 st.session_state.returns      = MOCK_RETURNS
@@ -645,8 +659,14 @@ if "df" not in st.session_state or fetch_btn:
                 kdf_str = kpi_date_from.strftime("%Y-%m-%d")
                 kdt_str = kpi_date_to.strftime("%Y-%m-%d")
 
-                # Основные данные графика
+                # Основные данные графика (по sku)
                 st.session_state.df = load_real_data(client_id, api_key, df_str, dt_str)
+
+                # Данные по дням — для delivered_units (продажи)
+                try:
+                    st.session_state.df_sales = load_real_sales_data(client_id, api_key, kdf_str, kdt_str)
+                except Exception:
+                    st.session_state.df_sales = pd.DataFrame()
 
                 # KPI данные — переиспользуем если период тот же
                 if kdf_str == df_str and kdt_str == dt_str:
@@ -680,6 +700,7 @@ if "df" not in st.session_state or fetch_btn:
             st.session_state.data_error   = str(e)
             st.session_state.df           = load_mock_data(date_from, date_to)
             st.session_state.df_kpi       = st.session_state.df
+            st.session_state.df_sales     = st.session_state.df
             st.session_state.balance      = 0.0
             st.session_state.balance_raw  = {}
             st.session_state.returns      = MOCK_RETURNS
@@ -689,7 +710,8 @@ if "df" not in st.session_state or fetch_btn:
 
 df: pd.DataFrame     = st.session_state.df
 df_kpi: pd.DataFrame = st.session_state.get("df_kpi", st.session_state.df)
-balance: float       = st.session_state.get("balance", MOCK_BALANCE)
+df_sales: pd.DataFrame = st.session_state.get("df_sales", st.session_state.df)
+balance: float       = st.session_state.get("balance", 0.0)
 returns: dict        = st.session_state.get("returns", MOCK_RETURNS)
 warehouse: dict      = st.session_state.get("warehouse", MOCK_WAREHOUSE)
 localization: list   = st.session_state.get("localization", MOCK_LOCALIZATION)
@@ -703,7 +725,7 @@ for col in METRIC_KEYS:
 # ─────────────────────────────────────────────
 # MAIN — HEADER
 # ─────────────────────────────────────────────
-hdr_left, hdr_right = st.columns([5, 1])
+hdr_left, hdr_mid, hdr_right = st.columns([5, 1, 1])
 
 with hdr_left:
     st.markdown("""
@@ -716,10 +738,78 @@ with hdr_left:
         </div>
     """, unsafe_allow_html=True)
 
+with hdr_mid:
+    if st.button("💳 Финансы", use_container_width=True, key="fin_hdr_toggle"):
+        st.session_state.show_finance = not st.session_state.get("show_finance", False)
+        st.session_state.show_settings = False
+
 with hdr_right:
     settings_open = st.button("⚙ Настройки", use_container_width=True, key="settings_toggle")
     if settings_open:
         st.session_state.show_settings = not st.session_state.get("show_settings", False)
+        st.session_state.show_finance = False
+
+# ── Панель ФИНАНСЫ (раскрывается под шапкой) ──
+if st.session_state.get("show_finance", False):
+    bal_raw  = st.session_state.get("balance_raw", {})
+    total_r  = bal_raw.get("total", {})
+    cf       = bal_raw.get("cashflows", {})
+    services = bal_raw.get("services", [])
+
+    if not total_r and USE_MOCK:
+        st.info("⚠ В демо-режиме финансовая детализация недоступна. Подключите API.")
+    elif not total_r:
+        st.warning("Нажмите ⟳ Загрузить данные в Настройках для обновления финансов.")
+    else:
+        closing   = float((total_r.get("closing_balance") or {}).get("value", 0))
+        sales_cf  = cf.get("sales", {})
+        sales_amt = float((sales_cf.get("amount") or {}).get("value", 0))
+        sales_fee = float((sales_cf.get("fee") or {}).get("value", 0))
+        ret_amt   = float((cf.get("returns", {}).get("amount") or {}).get("value", 0))
+
+        def _fmt(v): return f"₽{abs(v):,.0f}".replace(",", " ")
+
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        fc1.markdown(f'<div class="metric-card" style="border-top:3px solid #059669"><div class="metric-label">💰 Начислено за продажи</div><div class="metric-main" style="font-size:22px;color:#1a2040">{_fmt(sales_amt)}</div></div>', unsafe_allow_html=True)
+        fc2.markdown(f'<div class="metric-card" style="border-top:3px solid #e53e3e"><div class="metric-label">📦 Комиссия Ozon</div><div class="metric-main" style="font-size:22px;color:#1a2040">{_fmt(sales_fee)}</div></div>', unsafe_allow_html=True)
+        fc3.markdown(f'<div class="metric-card" style="border-top:3px solid #e53e3e"><div class="metric-label">↩️ Возвраты</div><div class="metric-main" style="font-size:22px;color:#1a2040">{_fmt(ret_amt)}</div></div>', unsafe_allow_html=True)
+        fc4.markdown(f'<div class="metric-card" style="border-top:3px solid #005bff"><div class="metric-label">🏦 Баланс на конец</div><div class="metric-main" style="font-size:22px;color:#1a2040">{_fmt(closing)}</div></div>', unsafe_allow_html=True)
+
+        if services:
+            SERVICE_NAMES = {
+                "goods_shelf_life_processing":   "Обработка срока годности",
+                "reverse_logistics":             "Обратная логистика",
+                "promotion_with_cost_per_order": "Продвижение (за заказ)",
+                "cross_docking":                 "Кросс-докинг",
+                "points_for_reviews":            "Баллы за отзывы",
+                "pay_per_click":                 "Реклама (клики)",
+                "acquiring":                     "Эквайринг",
+                "brand_promotion":               "Продвижение бренда",
+                "seller_bonuses":                "Бонусы продавца",
+                "logistics":                     "Логистика",
+                "courier_client_reinvoice":      "Курьерская доставка",
+            }
+            svc_rows = sorted([
+                {"Услуга": SERVICE_NAMES.get(s.get("name",""), s.get("name","")),
+                 "_val":   float((s.get("amount") or {}).get("value", 0))}
+                for s in services], key=lambda x: x["_val"])
+            svc_df = pd.DataFrame(svc_rows)
+            fig_svc = go.Figure(go.Bar(
+                y=svc_df["Услуга"], x=svc_df["_val"].abs(), orientation="h",
+                marker_color=["#ef4444" if v < 0 else "#059669" for v in svc_df["_val"]],
+                text=[f"₽{abs(v):,.0f}".replace(",", " ") for v in svc_df["_val"]],
+                textposition="outside",
+                hovertemplate="<b>%{y}</b><br>%{text}<extra></extra>",
+            ))
+            no_leg = {k: v for k, v in THEME.items() if k not in ("legend", "xaxis", "yaxis")}
+            fig_svc.update_layout(
+                **no_leg, height=max(250, len(svc_df) * 34),
+                xaxis=dict(gridcolor="#eef0f8", zeroline=False, tickfont=dict(size=11, color="#8a98c0")),
+                yaxis=dict(tickfont=dict(size=11, color="#1a2040"), automargin=True),
+            )
+            st.markdown('<div class="chart-box" style="margin-top:16px">', unsafe_allow_html=True)
+            st.plotly_chart(fig_svc, use_container_width=True, config={"displayModeBar": False})
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # ── Панель настроек (раскрывается под шапкой) ──
 if st.session_state.get("show_settings", False):
@@ -825,11 +915,19 @@ else:
 # ─────────────────────────────────────────────
 total_revenue    = float(df_kpi["revenue"].sum())
 total_orders     = int(df_kpi["ordered_units"].sum())
-total_sessions   = int(df_kpi["session_view"].sum())
 total_views      = int(df_kpi["hits_view"].sum())
+
+# delivered_units берём из df_sales (dimension=day, без sku)
+if "delivered_units" in df_sales.columns:
+    total_delivered  = int(df_sales["delivered_units"].sum())
+    revenue_delivered = float(df_sales["revenue"].sum()) if "revenue" in df_sales.columns else total_revenue
+else:
+    total_delivered   = 0
+    revenue_delivered = 0.0
 
 cvr       = (total_orders / total_views * 100) if total_views else 0
 avg_order = total_revenue / total_orders if total_orders else 0
+avg_delivered = revenue_delivered / total_delivered if total_delivered else 0
 
 kpi_period = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
 
@@ -850,10 +948,10 @@ with dp_col3:
     if st.button("✓ Применить", key="kpi_apply", use_container_width=True):
         st.session_state.kpi_date_from = new_kpi_from
         st.session_state.kpi_date_to   = new_kpi_to
-        # Сбрасываем df_kpi чтобы принудительно перезагрузить
-        for _k in ["df_kpi", "returns"]:
+        for _k in ["df_kpi", "df_sales", "returns"]:
             st.session_state.pop(_k, None)
         load_real_data.clear()
+        load_real_sales_data.clear()
         load_real_returns.clear()
         st.rerun()
 
@@ -920,7 +1018,7 @@ def single_card(col, css_cls, icon, label, main_val, delta, delta_cls="delta-neu
     """, unsafe_allow_html=True)
 
 
-# Карточка 1 — ЗАКАЗЫ: выручка / количество оформленных
+# Карточка 1 — ЗАКАЗЫ: оформленные (revenue + ordered_units)
 dual_card(
     c1, "card-orders", "📦", "ЗАКАЗЫ",
     main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
@@ -929,15 +1027,25 @@ dual_card(
     delta=f"Ср. чек ₽{avg_order:,.0f}".replace(",", " "),
 )
 
-# Карточка 2 — ПРОДАЖИ: выручка / заказы + конверсия
-dual_card(
-    c2, "card-sales", "💰", "ПРОДАЖИ",
-    main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
-    sep="/",
-    sub_val=f"{total_orders:,} шт".replace(",", " "),
-    delta=f"▲ Конверсия {cvr:.1f}%" if cvr > 0 else "Нет данных о просмотрах",
-    delta_cls="delta-pos" if cvr > 2 else "delta-neu",
-)
+# Карточка 2 — ПРОДАЖИ: выкупленные (delivered_units + revenue_delivered)
+if total_delivered > 0:
+    dual_card(
+        c2, "card-sales", "💰", "ПРОДАЖИ",
+        main_val=f"₽{revenue_delivered:,.0f}".replace(",", " "),
+        sep="/",
+        sub_val=f"{total_delivered:,} выкуп.".replace(",", " "),
+        delta=f"▲ Конверсия {cvr:.1f}%" if cvr > 0 else f"Ср. чек ₽{avg_delivered:,.0f}".replace(",", " "),
+        delta_cls="delta-pos" if cvr > 2 else "delta-neu",
+    )
+else:
+    dual_card(
+        c2, "card-sales", "💰", "ПРОДАЖИ",
+        main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
+        sep="/",
+        sub_val=f"{total_orders:,} шт".replace(",", " "),
+        delta="Данные о выкупе загружаются…",
+        delta_cls="delta-neu",
+    )
 
 # Карточка 3 — БАЛАНС
 bal_str = f"₽{balance:,.0f}".replace(",", " ")
@@ -1152,63 +1260,6 @@ if st.session_state.show_finance:
         fin_card(fc4, "🏦 Баланс на конец",        closing,       "delta-pos")
 
         # ── Детализация услуг ──
-        if services:
-            st.markdown("""<div style="font-size:11px;font-weight:600;color:#7a88b8;
-                letter-spacing:.08em;text-transform:uppercase;margin:20px 0 8px">
-                Детализация услуг</div>""", unsafe_allow_html=True)
-
-            SERVICE_NAMES = {
-                "goods_shelf_life_processing": "Обработка срока годности",
-                "reverse_logistics":           "Обратная логистика",
-                "promotion_with_cost_per_order": "Продвижение (за заказ)",
-                "cross_docking":               "Кросс-докинг",
-                "points_for_reviews":          "Баллы за отзывы",
-                "pay_per_click":               "Реклама (клики)",
-                "acquiring":                   "Эквайринг",
-                "brand_promotion":             "Продвижение бренда",
-                "seller_bonuses":              "Бонусы продавца",
-                "logistics":                   "Логистика",
-                "courier_client_reinvoice":    "Курьерская доставка",
-            }
-            svc_rows = []
-            for svc in services:
-                name = svc.get("name", "")
-                amt  = float((svc.get("amount") or {}).get("value", 0))
-                svc_rows.append({
-                    "Услуга": SERVICE_NAMES.get(name, name),
-                    "Сумма":  f"₽{amt:,.2f}".replace(",", " "),
-                    "_val":   amt,
-                })
-            svc_rows.sort(key=lambda x: x["_val"])
-
-            # Горизонтальный бар-чарт услуг
-            svc_df = pd.DataFrame(svc_rows)
-            fig_svc = go.Figure(go.Bar(
-                y=svc_df["Услуга"],
-                x=svc_df["_val"].abs(),
-                orientation="h",
-                marker_color=["#ef4444" if v < 0 else "#059669" for v in svc_df["_val"]],
-                text=svc_df["Сумма"],
-                textposition="outside",
-                hovertemplate="<b>%{y}</b><br>%{text}<extra></extra>",
-            ))
-            no_leg = {k: v for k, v in THEME.items() if k not in ("legend", "xaxis", "yaxis")}
-            fig_svc.update_layout(
-                **no_leg,
-                height=max(250, len(svc_df) * 34),
-                xaxis=dict(gridcolor="#eef0f8", zeroline=False,
-                           tickfont=dict(size=11, color="#8a98c0")),
-                yaxis=dict(tickfont=dict(size=11, color="#1a2040"), automargin=True),
-            )
-            st.markdown('<div class="chart-box">', unsafe_allow_html=True)
-            st.plotly_chart(fig_svc, use_container_width=True, config={"displayModeBar": False})
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            # Период финансов
-            payload_sent = bal_raw.get("_payload_sent", {})
-            if payload_sent:
-                st.caption(f"Период: {payload_sent.get('date_from', '')} — {payload_sent.get('date_to', '')}")
-
 # ─────────────────────────────────────────────
 # FOOTER
 # ─────────────────────────────────────────────
