@@ -909,6 +909,17 @@ else:
             st.error(f"Ошибка запроса баланса: {_e}")
         if st.session_state.get("data_error"):
             st.error(f"Последняя ошибка API: {st.session_state.data_error}")
+        if not USE_MOCK:
+            st.markdown("**🏭 Сырой ответ /v3/product/info/stocks (первые 2):**")
+            try:
+                _c = OzonClient(client_id=client_id, api_key=api_key)
+                _r = _c.session.post(
+                    f"{_c.BASE_URL}/v3/product/info/stocks",
+                    data=json.dumps({"limit": 2, "offset": 0}), timeout=15)
+                st.write(f"Status: {_r.status_code}")
+                st.json(_r.json())
+            except Exception as _e:
+                st.error(f"Ошибка: {_e}")
 
 # ─────────────────────────────────────────────
 # AGGREGATES  (KPI период)
