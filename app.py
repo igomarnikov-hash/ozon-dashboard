@@ -221,58 +221,63 @@ class OzonClient:
         return {"count": len(all_r), "sum": total_sum}
 
     def get_warehouse_stocks(self):
-        """Получает FBO остатки и цены для расчёта капитализации."""
-        # Шаг 1: получаем список товаров с остатками через /v3/product/info/stocks
-        all_items, offset = [], 0
+        """
+        POST /v2/analytics/stock_on_warehouses — FBO остатки.
+        POST /v5/product/info/prices — цены по offer_id.
+        """
+        # Шаг 1: остатки FBO по складам
+        all_rows, offset = [], 0
         while True:
             payload = {"limit": 1000, "offset": offset}
-            r = self.session.post(f"{self.BASE_URL}/v3/product/info/stocks",
-                                  data=json.dumps(payload), timeout=30)
+            r = self.session.post(
+                f"{self.BASE_URL}/v2/analytics/stock_on_warehouses",
+                data=json.dumps(payload), timeout=30,
+            )
             if not r.ok:
                 break
-            result = r.json().get("result", {})
-            items  = result.get("items", [])
-            all_items.extend(items)
-            if len(items) < 1000:
+            rows = r.json().get("result", {}).get("rows", [])
+            all_rows.extend(rows)
+            if len(rows) < 1000:
                 break
             offset += 1000
 
-        if not all_items:
+        if not all_rows:
             return []
 
-        # Шаг 2: получаем цены
-        product_ids = [item.get("product_id") for item in all_items if item.get("product_id")]
-        prices_resp = self.session.post(
-            f"{self.BASE_URL}/v5/product/info/prices",
-            data=json.dumps({"filter": {"product_id": product_ids[:1000]}, "limit": 1000, "offset": 0}),
-            timeout=30,
-        )
-        price_map = {}
-        if prices_resp.ok:
-            for p in prices_resp.json().get("result", {}).get("items", []):
-                pid   = str(p.get("product_id", ""))
-                price = float(p.get("price", {}).get("price", 0) or 0)
-                if price:
-                    price_map[pid] = price
+        # Агрегируем по item_code (offer_id/SKU)
+        sku_agg: dict = {}
+        for row in all_rows:
+            sku_id   = str(row.get("item_code", row.get("sku", "")))
+            sku_name = row.get("item_name", sku_id)
+            units    = int(row.get("free_to_sell_amount", 0) or 0)
+            if sku_id not in sku_agg:
+                sku_agg[sku_id] = {"sku_name": sku_name, "units": 0}
+            sku_agg[sku_id]["units"] += units
 
-        # Шаг 3: формируем результат
-        rows = []
-        for item in all_items:
-            pid      = str(item.get("product_id", ""))
-            sku_id   = str(item.get("offer_id", pid))
-            sku_name = item.get("name", sku_id)
-            # FBO остатки — суммируем present по всем складам типа fbo
-            stocks = item.get("stocks", [])
-            units  = sum(int(s.get("present", 0))
-                         for s in stocks if s.get("type", "").lower() == "fbo")
-            if units > 0:
-                rows.append({
-                    "sku": sku_id, "item_name": sku_name,
-                    "free_to_sell_amount": units,
-                    "product_id": pid,
-                    "_price": price_map.get(pid, 0.0),
-                })
-        return rows
+        # Шаг 2: цены через v5/product/info/prices
+        price_map: dict = {}
+        price_r = self.session.post(
+            f"{self.BASE_URL}/v5/product/info/prices",
+            data=json.dumps({"limit": 1000, "offset": 0}), timeout=30,
+        )
+        if price_r.ok:
+            for p in price_r.json().get("result", {}).get("items", []):
+                offer_id = str(p.get("offer_id", ""))
+                price = float(p.get("price", {}).get("price", 0) or 0)
+                if price and offer_id:
+                    price_map[offer_id] = price
+
+        # Собираем итог
+        result = []
+        for sku_id, info in sku_agg.items():
+            price = price_map.get(sku_id, 0.0)
+            result.append({
+                "sku":                 sku_id,
+                "item_name":           info["sku_name"],
+                "free_to_sell_amount": info["units"],
+                "_price":              price,
+            })
+        return result
 
     def get_product_prices(self, product_ids: list):
         """POST /v5/product/info/prices — цены товаров."""
@@ -910,14 +915,17 @@ else:
         if st.session_state.get("data_error"):
             st.error(f"Последняя ошибка API: {st.session_state.data_error}")
         if not USE_MOCK:
-            st.markdown("**🏭 Сырой ответ /v3/product/info/stocks (первые 2):**")
+            st.markdown("**🏭 Сырой ответ /v2/analytics/stock_on_warehouses (первые 2):**")
             try:
                 _c = OzonClient(client_id=client_id, api_key=api_key)
                 _r = _c.session.post(
-                    f"{_c.BASE_URL}/v3/product/info/stocks",
+                    f"{_c.BASE_URL}/v2/analytics/stock_on_warehouses",
                     data=json.dumps({"limit": 2, "offset": 0}), timeout=15)
                 st.write(f"Status: {_r.status_code}")
-                st.json(_r.json())
+                if _r.ok:
+                    st.json(_r.json())
+                else:
+                    st.error(_r.text[:300])
             except Exception as _e:
                 st.error(f"Ошибка: {_e}")
 
@@ -1164,7 +1172,8 @@ st.dataframe(disp[show_cols], use_container_width=True, height=380)
 st.markdown('<div class="section-title">🏭 Капитализация складов</div>', unsafe_allow_html=True)
 
 # Если данные mock — пробуем загрузить реальные прямо сейчас
-if warehouse == MOCK_WAREHOUSE and not USE_MOCK:
+if not USE_MOCK and (warehouse == MOCK_WAREHOUSE or not warehouse.get("items")):
+    load_real_warehouse.clear()
     with st.spinner("Загрузка остатков склада…"):
         try:
             warehouse = load_real_warehouse(client_id, api_key)
