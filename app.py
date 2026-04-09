@@ -944,6 +944,19 @@ else:
                     st.error(_r.text[:300])
             except Exception as _e:
                 st.error(f"Ошибка: {_e}")
+            st.markdown("**💰 Сырой ответ /v5/product/info/prices (первые 2):**")
+            try:
+                _c2 = OzonClient(client_id=client_id, api_key=api_key)
+                _rp = _c2.session.post(
+                    f"{_c2.BASE_URL}/v5/product/info/prices",
+                    data=json.dumps({"limit": 2, "offset": 0}), timeout=15)
+                st.write(f"Status: {_rp.status_code}")
+                if _rp.ok:
+                    st.json(_rp.json())
+                else:
+                    st.error(_rp.text[:300])
+            except Exception as _e:
+                st.error(f"Ошибка цен: {_e}")
 
 # ─────────────────────────────────────────────
 # AGGREGATES  (KPI период)
