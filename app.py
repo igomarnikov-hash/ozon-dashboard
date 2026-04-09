@@ -223,9 +223,9 @@ class OzonClient:
     def get_warehouse_stocks(self):
         """
         POST /v2/analytics/stock_on_warehouses — FBO остатки.
-        POST /v5/product/info/prices — цены по offer_id.
+        Структура: sku (int), item_code (offer_id), item_name, free_to_sell_amount
         """
-        # Шаг 1: остатки FBO по складам
+        # Шаг 1: все остатки FBO
         all_rows, offset = [], 0
         while True:
             payload = {"limit": 1000, "offset": offset}
@@ -244,17 +244,19 @@ class OzonClient:
         if not all_rows:
             return []
 
-        # Агрегируем по item_code (offer_id/SKU)
+        # Агрегируем по item_code (offer_id продавца)
         sku_agg: dict = {}
         for row in all_rows:
-            sku_id   = str(row.get("item_code", row.get("sku", "")))
-            sku_name = row.get("item_name", sku_id)
+            offer_id = str(row.get("item_code", ""))
+            sku_name = row.get("item_name", offer_id)
             units    = int(row.get("free_to_sell_amount", 0) or 0)
-            if sku_id not in sku_agg:
-                sku_agg[sku_id] = {"sku_name": sku_name, "units": 0}
-            sku_agg[sku_id]["units"] += units
+            if not offer_id:
+                continue
+            if offer_id not in sku_agg:
+                sku_agg[offer_id] = {"sku_name": sku_name, "units": 0}
+            sku_agg[offer_id]["units"] += units
 
-        # Шаг 2: цены через v5/product/info/prices
+        # Шаг 2: цены по offer_id через v5/product/info/prices
         price_map: dict = {}
         price_r = self.session.post(
             f"{self.BASE_URL}/v5/product/info/prices",
@@ -262,58 +264,78 @@ class OzonClient:
         )
         if price_r.ok:
             for p in price_r.json().get("result", {}).get("items", []):
-                offer_id = str(p.get("offer_id", ""))
+                oid   = str(p.get("offer_id", ""))
                 price = float(p.get("price", {}).get("price", 0) or 0)
-                if price and offer_id:
-                    price_map[offer_id] = price
+                if price and oid:
+                    price_map[oid] = price
 
-        # Собираем итог
         result = []
-        for sku_id, info in sku_agg.items():
-            price = price_map.get(sku_id, 0.0)
+        for offer_id, info in sku_agg.items():
             result.append({
-                "sku":                 sku_id,
+                "sku":                 offer_id,
                 "item_name":           info["sku_name"],
                 "free_to_sell_amount": info["units"],
-                "_price":              price,
+                "_price":              price_map.get(offer_id, 0.0),
             })
         return result
 
-    def get_product_prices(self, product_ids: list):
-        """POST /v5/product/info/prices — цены товаров."""
-        if not product_ids:
-            return []
-        payload = {
-            "filter": {"product_id": [int(p) for p in product_ids[:1000] if str(p).isdigit()]},
-            "limit": 1000, "offset": 0,
-        }
-        r = self.session.post(f"{self.BASE_URL}/v5/product/info/prices",
-                              data=json.dumps(payload), timeout=30)
-        if r.ok:
-            return r.json().get("result", {}).get("items", [])
-        return []
-
     def get_localization(self):
-        """Уровень локализации через /v1/analytics/data с dimension sku + cluster."""
-        # Пробуем специальный эндпоинт локализации
-        for path, payload in [
-            ("/v1/analytics/item-localization", {"limit": 1000, "offset": 0}),
-            ("/v1/product/list", {"filter": {}, "limit": 1000, "offset": 0}),
-        ]:
-            try:
-                r = self.session.post(f"{self.BASE_URL}{path}",
-                                      data=json.dumps(payload), timeout=15)
-                if r.ok:
-                    data  = r.json()
-                    items = (data.get("result", {}).get("items") or
-                             data.get("result", {}).get("rows") or [])
-                    # Проверяем что есть поля локализации
-                    if items and any("cluster" in str(i).lower() or
-                                     "locali" in str(i).lower() for i in items[:3]):
-                        return items
-            except Exception:
-                continue
-        return []
+        """
+        POST /v1/cluster/list — список кластеров.
+        POST /v2/analytics/stock_on_warehouses — считаем на скольких кластерах есть товар.
+        """
+        # Получаем все остатки по складам
+        all_rows, offset = [], 0
+        while True:
+            payload = {"limit": 1000, "offset": offset}
+            r = self.session.post(
+                f"{self.BASE_URL}/v2/analytics/stock_on_warehouses",
+                data=json.dumps(payload), timeout=30,
+            )
+            if not r.ok:
+                break
+            rows = r.json().get("result", {}).get("rows", [])
+            all_rows.extend(rows)
+            if len(rows) < 1000:
+                break
+            offset += 1000
+
+        if not all_rows:
+            return []
+
+        # Получаем список кластеров чтобы знать total
+        clusters_r = self.session.post(
+            f"{self.BASE_URL}/v1/cluster/list",
+            data=json.dumps({}), timeout=15,
+        )
+        total_clusters = 23  # fallback — количество кластеров Ozon
+        if clusters_r.ok:
+            cl_data = clusters_r.json().get("result", {})
+            cl_list = cl_data.get("clusters", cl_data.get("items", []))
+            if cl_list:
+                total_clusters = len(cl_list)
+
+        # Считаем для каждого item_code на скольких разных складах есть остаток > 0
+        from collections import defaultdict
+        sku_warehouses: dict = defaultdict(set)
+        sku_names: dict = {}
+        for row in all_rows:
+            offer_id = str(row.get("item_code", ""))
+            wh_name  = row.get("warehouse_name", "")
+            units    = int(row.get("free_to_sell_amount", 0) or 0)
+            if offer_id and wh_name and units > 0:
+                sku_warehouses[offer_id].add(wh_name)
+                sku_names[offer_id] = row.get("item_name", offer_id)
+
+        result = []
+        for offer_id, warehouses in sku_warehouses.items():
+            result.append({
+                "sku_id":   offer_id,
+                "sku_name": sku_names.get(offer_id, offer_id),
+                "clusters": len(warehouses),
+                "_total":   total_clusters,
+            })
+        return sorted(result, key=lambda x: x["clusters"], reverse=True)
 
 
 # ─────────────────────────────────────────────
@@ -617,19 +639,13 @@ def load_real_warehouse(_cid, _key):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_real_localization(_cid, _key):
-    """Загружает уровень локализации по SKU."""
+    """Загружает уровень локализации — считается из stock_on_warehouses."""
     client = OzonClient(client_id=_cid, api_key=_key)
     items = client.get_localization()
     if not items:
         return MOCK_LOCALIZATION
-    result = []
-    for item in items:
-        result.append({
-            "sku_id":   str(item.get("sku", item.get("product_id", ""))),
-            "sku_name": item.get("name", ""),
-            "clusters": int(item.get("clusters_count", item.get("warehouses_count", 0))),
-        })
-    return sorted(result, key=lambda x: x["clusters"], reverse=True)
+    # get_localization уже возвращает {sku_id, sku_name, clusters}
+    return items
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
