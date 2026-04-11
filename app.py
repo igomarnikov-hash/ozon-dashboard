@@ -258,19 +258,29 @@ class OzonClient:
 
         # Шаг 2: цены — filter обязателен для v5/product/info/prices
         price_map: dict = {}
-        price_r = self.session.post(
-            f"{self.BASE_URL}/v5/product/info/prices",
-            data=json.dumps({
-                "filter": {"visibility": "ALL"},
-                "limit": 1000, "offset": 0
-            }), timeout=30,
-        )
-        if price_r.ok:
-            for p in price_r.json().get("result", {}).get("items", []):
-                oid   = str(p.get("offer_id", ""))
-                price = float(p.get("price", {}).get("price", 0) or 0)
-                if price and oid:
+        price_offset = 0
+        while True:
+            price_r = self.session.post(
+                f"{self.BASE_URL}/v5/product/info/prices",
+                data=json.dumps({
+                    "filter": {"visibility": "ALL"},
+                    "limit": 1000, "offset": price_offset
+                }), timeout=30,
+            )
+            if not price_r.ok:
+                break
+            price_items = price_r.json().get("result", {}).get("items", [])
+            for p in price_items:
+                oid = str(p.get("offer_id", ""))
+                # price.price — основная цена продавца
+                price_obj = p.get("price", {}) or {}
+                price = float(price_obj.get("price", 0) or
+                              price_obj.get("min_price", 0) or 0)
+                if oid:
                     price_map[oid] = price
+            if len(price_items) < 1000:
+                break
+            price_offset += 1000
 
         result = []
         for offer_id, info in sku_agg.items():
@@ -962,30 +972,6 @@ else:
                 st.error(f"Ошибка цен: {_e}")
 
 # ─────────────────────────────────────────────
-# AGGREGATES  (KPI период)
-# ─────────────────────────────────────────────
-total_revenue    = float(df_kpi["revenue"].sum())
-total_orders     = int(df_kpi["ordered_units"].sum())
-total_views      = int(df_kpi["hits_view"].sum())
-
-# delivered_units берём из df_sales (dimension=day, без sku)
-if "delivered_units" in df_sales.columns:
-    total_delivered  = int(df_sales["delivered_units"].sum())
-    revenue_delivered = float(df_sales["revenue"].sum()) if "revenue" in df_sales.columns else total_revenue
-else:
-    total_delivered   = 0
-    revenue_delivered = 0.0
-
-cvr       = (total_orders / total_views * 100) if total_views else 0
-avg_order = total_revenue / total_orders if total_orders else 0
-avg_delivered = revenue_delivered / total_delivered if total_delivered else 0
-
-kpi_period = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
-
-# ─────────────────────────────────────────────
-# KPI CARDS  (4 карточки)
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
 # KPI DATE PICKER — inline прямо над карточками
 # ─────────────────────────────────────────────
 st.markdown(f'<div class="section-title">📊 Ключевые показатели · <span style="font-weight:400;color:#8a98c0">{kpi_period}</span></div>', unsafe_allow_html=True)
@@ -1005,6 +991,7 @@ with dp_col3:
         load_real_sales_data.clear()
         load_real_returns.clear()
         st.rerun()
+
 kpi_date_from = st.session_state.kpi_date_from
 kpi_date_to   = st.session_state.kpi_date_to
 kpi_period    = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
@@ -1016,7 +1003,6 @@ if "df_kpi" not in st.session_state or "df_sales" not in st.session_state:
     df_str  = date_from.strftime("%Y-%m-%d")
     dt_str  = date_to.strftime("%Y-%m-%d")
     with st.spinner("Загрузка KPI…"):
-        # df_kpi
         if "df_kpi" not in st.session_state:
             if kdf_str == df_str and kdt_str == dt_str:
                 st.session_state.df_kpi = st.session_state.df
@@ -1028,22 +1014,19 @@ if "df_kpi" not in st.session_state or "df_sales" not in st.session_state:
                         st.session_state.df_kpi = load_real_data(client_id, api_key, kdf_str, kdt_str)
                 except Exception:
                     st.session_state.df_kpi = st.session_state.df
-        # df_sales — всегда загружаем за KPI период (день без SKU)
         if "df_sales" not in st.session_state:
             try:
                 if USE_MOCK:
-                    st.session_state.df_sales = st.session_state.df
+                    st.session_state.df_sales = pd.DataFrame()  # mock не имеет delivered_units
                 else:
                     st.session_state.df_sales = load_real_sales_data(client_id, api_key, kdf_str, kdt_str)
             except Exception:
                 st.session_state.df_sales = pd.DataFrame()
-        # returns
         try:
             if not USE_MOCK and "returns" not in st.session_state:
                 st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
         except Exception:
             pass
-        # warehouse и localization — если ещё не загружены
         if "warehouse" not in st.session_state or st.session_state.warehouse == MOCK_WAREHOUSE:
             try:
                 if not USE_MOCK:
@@ -1065,6 +1048,25 @@ localization = st.session_state.get("localization", MOCK_LOCALIZATION)
 for col in METRIC_KEYS:
     if col not in df_kpi.columns:
         df_kpi[col] = 0.0
+
+# ─────────────────────────────────────────────
+# AGGREGATES  (KPI период) — ПОСЛЕ загрузки данных
+# ─────────────────────────────────────────────
+total_revenue = float(df_kpi["revenue"].sum())
+total_orders  = int(df_kpi["ordered_units"].sum())
+total_views   = int(df_kpi["hits_view"].sum())
+
+# delivered_units из df_sales (dimension=day, без sku) — реально выкупленные
+if not df_sales.empty and "delivered_units" in df_sales.columns:
+    total_delivered   = int(df_sales["delivered_units"].sum())
+    revenue_delivered = float(df_sales["revenue"].sum()) if "revenue" in df_sales.columns else 0.0
+else:
+    total_delivered   = 0
+    revenue_delivered = 0.0
+
+cvr           = (total_orders / total_views * 100) if total_views else 0
+avg_order     = total_revenue / total_orders if total_orders else 0
+avg_delivered = revenue_delivered / total_delivered if total_delivered else 0
 
 c1, c2, c3, c4 = st.columns(4)
 
