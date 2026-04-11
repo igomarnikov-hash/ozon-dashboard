@@ -256,11 +256,14 @@ class OzonClient:
                 sku_agg[offer_id] = {"sku_name": sku_name, "units": 0}
             sku_agg[offer_id]["units"] += units
 
-        # Шаг 2: цены по offer_id через v5/product/info/prices
+        # Шаг 2: цены — filter обязателен для v5/product/info/prices
         price_map: dict = {}
         price_r = self.session.post(
             f"{self.BASE_URL}/v5/product/info/prices",
-            data=json.dumps({"limit": 1000, "offset": 0}), timeout=30,
+            data=json.dumps({
+                "filter": {"visibility": "ALL"},
+                "limit": 1000, "offset": 0
+            }), timeout=30,
         )
         if price_r.ok:
             for p in price_r.json().get("result", {}).get("items", []):
@@ -949,7 +952,7 @@ else:
                 _c2 = OzonClient(client_id=client_id, api_key=api_key)
                 _rp = _c2.session.post(
                     f"{_c2.BASE_URL}/v5/product/info/prices",
-                    data=json.dumps({"limit": 2, "offset": 0}), timeout=15)
+                    data=json.dumps({"filter": {"visibility": "ALL"}, "limit": 2, "offset": 0}), timeout=15)
                 st.write(f"Status: {_rp.status_code}")
                 if _rp.ok:
                     st.json(_rp.json())
