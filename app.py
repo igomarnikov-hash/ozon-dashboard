@@ -974,6 +974,10 @@ else:
 # ─────────────────────────────────────────────
 # KPI DATE PICKER — inline прямо над карточками
 # ─────────────────────────────────────────────
+kpi_date_from = st.session_state.kpi_date_from
+kpi_date_to   = st.session_state.kpi_date_to
+kpi_period    = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
+
 st.markdown(f'<div class="section-title">📊 Ключевые показатели · <span style="font-weight:400;color:#8a98c0">{kpi_period}</span></div>', unsafe_allow_html=True)
 
 dp_col1, dp_col2, dp_col3, dp_spacer = st.columns([1.5, 1.5, 1.5, 5])
