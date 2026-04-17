@@ -357,45 +357,61 @@ class OzonClient:
 
     def get_supply_in_transit(self):
         """
-        POST /v1/supply-order/list — поставки FBO в пути (статус IN_TRANSIT / ACCEPTED).
-        Возвращает список: cluster, sku_id, sku_name, quantity, total_sum
+        POST /v2/posting/fbo/list — FBO отправления в статусе awaiting_deliver / delivering.
+        Возвращает список: cluster, sku_id, sku_name, quantity, sum
         """
-        all_orders, offset = [], 0
-        while True:
-            payload = {
-                "filter": {"states": ["IN_TRANSIT", "ACCEPTED", "DELIVERING"]},
-                "limit": 50, "offset": offset,
-            }
-            r = self.session.post(
-                f"{self.BASE_URL}/v1/supply-order/list",
-                data=json.dumps(payload), timeout=30,
-            )
-            if not r.ok:
-                break
-            items = r.json().get("result", {}).get("supply_orders", [])
-            all_orders.extend(items)
-            if len(items) < 50:
-                break
-            offset += 50
-
         rows = []
-        for order in all_orders:
-            cluster   = order.get("cluster_name", order.get("warehouse_name", "—"))
-            order_sum = float(order.get("total_price", order.get("supply_price", 0)) or 0)
-            for item in order.get("items", []):
-                sku_id   = str(item.get("offer_id", item.get("sku", "")))
-                sku_name = item.get("name", sku_id)
-                qty      = int(item.get("quantity", 0) or 0)
-                price    = float(item.get("price", 0) or 0)
-                item_sum = qty * price if price else 0.0
-                rows.append({
-                    "cluster":  cluster,
-                    "sku_id":   sku_id,
-                    "sku_name": sku_name,
-                    "quantity": qty,
-                    "sum":      item_sum,
-                })
+        for status in ("awaiting_deliver", "delivering", "driver_pickup"):
+            offset = 0
+            while True:
+                payload = {
+                    "dir": "asc",
+                    "filter": {"status": status},
+                    "limit": 1000,
+                    "offset": offset,
+                    "with": {"financial_data": True, "analytics_data": True},
+                }
+                r = self.session.post(
+                    f"{self.BASE_URL}/v2/posting/fbo/list",
+                    data=json.dumps(payload), timeout=30,
+                )
+                if not r.ok:
+                    break
+                postings = r.json().get("result", [])
+                for posting in postings:
+                    analytics = posting.get("analytics_data", {}) or {}
+                    cluster   = analytics.get("warehouse_name", "—")
+                    fin       = posting.get("financial_data", {}) or {}
+                    products  = fin.get("products", posting.get("products", []))
+                    for prod in products:
+                        sku_id   = str(prod.get("offer_id", prod.get("sku", "")))
+                        sku_name = prod.get("name", sku_id)
+                        qty      = int(prod.get("quantity", 0) or 0)
+                        price    = float(prod.get("price", 0) or 0)
+                        rows.append({
+                            "cluster":  cluster,
+                            "sku_id":   sku_id,
+                            "sku_name": sku_name,
+                            "quantity": qty,
+                            "sum":      qty * price,
+                        })
+                if len(postings) < 1000:
+                    break
+                offset += 1000
         return rows
+
+    def debug_prices(self, sample_offer_ids: list) -> dict:
+        """Диагностика: возвращает сырой ответ v5/product/info/prices для первых товаров."""
+        r = self.session.post(
+            f"{self.BASE_URL}/v5/product/info/prices",
+            data=json.dumps({
+                "filter": {"offer_id": sample_offer_ids[:10], "visibility": "ALL"},
+                "limit": 10, "offset": 0,
+            }), timeout=15,
+        )
+        return {"status": r.status_code, "body": r.json() if r.ok else r.text}
+
+
 
 
 
@@ -1325,6 +1341,30 @@ with wh_c2:
             "sum_fmt": "Стоимость", "units_fmt": "Остаток", "share": "Доля"
         })
         st.dataframe(wh_disp, use_container_width=True, height=320)
+
+        # Диагностика цен — показываем если все цены = 0
+        if not USE_MOCK and wh_sum == 0 and wh_items:
+            with st.expander("🔍 Диагностика цен (стоимость = ₽0)", expanded=True):
+                try:
+                    sample_ids = [it["sku_id"] for it in wh_items[:5]]
+                    _client = OzonClient(client_id=client_id, api_key=api_key)
+                    dbg = _client.debug_prices(sample_ids)
+                    st.caption(f"HTTP {dbg['status']} · offer_ids запрошены: {sample_ids}")
+                    body = dbg["body"]
+                    items_raw = body.get("result", {}).get("items", [])
+                    if items_raw:
+                        st.caption("Поля первого товара из ответа API:")
+                        first = items_raw[0]
+                        st.json({
+                            "offer_id":   first.get("offer_id"),
+                            "product_id": first.get("product_id"),
+                            "price":      first.get("price"),
+                        })
+                    else:
+                        st.warning("API вернул пустой список items. Полный ответ:")
+                        st.json(body)
+                except Exception as _dbg_e:
+                    st.error(f"Ошибка диагностики: {_dbg_e}")
     else:
         st.info("Нет данных об остатках на складе")
 
