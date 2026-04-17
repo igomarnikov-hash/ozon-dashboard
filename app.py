@@ -276,15 +276,13 @@ class OzonClient:
             price_items = (price_json.get("items")
                            or price_json.get("result", {}).get("items", []))
             for p in price_items:
-                oid     = str(p.get("offer_id", ""))
-                prod_id = str(p.get("product_id", ""))
-                # Цена продавца: marketing_price → price → min_price → old_price
-                price = float(
-                    p.get("marketing_price") or
-                    p.get("price") or
-                    p.get("min_price") or
-                    p.get("old_price") or 0
-                )
+                oid       = str(p.get("offer_id", ""))
+                prod_id   = str(p.get("product_id", ""))
+                price_obj = p.get("price", {}) or {}
+                # marketing_seller_price — цена с учётом акций продавца (внутри price{})
+                marketing = float(price_obj.get("marketing_seller_price") or 0)
+                base      = float(price_obj.get("price") or price_obj.get("min_price") or 0)
+                price     = marketing if marketing > 0 else base
                 if oid:
                     price_by_offer[oid] = price
                 if prod_id:
@@ -293,7 +291,7 @@ class OzonClient:
                 break
             price_offset += 1000
 
-        # Если v4 вернул пустой список — пробуем v5 с другой структурой
+        # Если v4 вернул пустой список — пробуем v5 с той же логикой
         if not price_by_offer:
             price_offset = 0
             while True:
@@ -310,15 +308,12 @@ class OzonClient:
                 price_items = (price_json.get("items")
                                or price_json.get("result", {}).get("items", []))
                 for p in price_items:
-                    oid     = str(p.get("offer_id", ""))
-                    prod_id = str(p.get("product_id", ""))
+                    oid       = str(p.get("offer_id", ""))
+                    prod_id   = str(p.get("product_id", ""))
                     price_obj = p.get("price", {}) or {}
-                    price = float(
-                        p.get("marketing_price") or
-                        price_obj.get("marketing_price") or
-                        price_obj.get("price") or
-                        price_obj.get("min_price") or 0
-                    )
+                    marketing = float(price_obj.get("marketing_seller_price") or 0)
+                    base      = float(price_obj.get("price") or price_obj.get("min_price") or 0)
+                    price     = marketing if marketing > 0 else base
                     if oid:
                         price_by_offer[oid] = price
                     if prod_id:
