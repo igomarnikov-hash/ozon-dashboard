@@ -257,14 +257,13 @@ class OzonClient:
                 sku_agg[offer_id] = {"sku_name": sku_name, "units": 0, "sku_int": sku_int}
             sku_agg[offer_id]["units"] += units
 
-        # Шаг 2: цены из v5/product/info/prices
-        # Строим два индекса: по offer_id и по числовому product_id/sku
+        # Шаг 2: цены из v4/product/info/prices (items на верхнем уровне ответа)
         price_by_offer: dict = {}
         price_by_sku:   dict = {}
         price_offset = 0
         while True:
             price_r = self.session.post(
-                f"{self.BASE_URL}/v5/product/info/prices",
+                f"{self.BASE_URL}/v4/product/info/prices",
                 data=json.dumps({
                     "filter": {"visibility": "ALL"},
                     "limit": 1000, "offset": price_offset
@@ -272,16 +271,19 @@ class OzonClient:
             )
             if not price_r.ok:
                 break
-            price_items = price_r.json().get("result", {}).get("items", [])
+            price_json = price_r.json()
+            # Ozon возвращает items на верхнем уровне ИЛИ внутри result
+            price_items = (price_json.get("items")
+                           or price_json.get("result", {}).get("items", []))
             for p in price_items:
-                oid       = str(p.get("offer_id", ""))
-                prod_id   = str(p.get("product_id", ""))
-                price_obj = p.get("price", {}) or {}
-                # Берём selling_price → price → min_price (приоритет по убыванию)
+                oid     = str(p.get("offer_id", ""))
+                prod_id = str(p.get("product_id", ""))
+                # Цена продавца: marketing_price → price → min_price → old_price
                 price = float(
-                    price_obj.get("selling_price") or
-                    price_obj.get("price") or
-                    price_obj.get("min_price") or 0
+                    p.get("marketing_price") or
+                    p.get("price") or
+                    p.get("min_price") or
+                    p.get("old_price") or 0
                 )
                 if oid:
                     price_by_offer[oid] = price
@@ -290,6 +292,40 @@ class OzonClient:
             if len(price_items) < 1000:
                 break
             price_offset += 1000
+
+        # Если v4 вернул пустой список — пробуем v5 с другой структурой
+        if not price_by_offer:
+            price_offset = 0
+            while True:
+                price_r = self.session.post(
+                    f"{self.BASE_URL}/v5/product/info/prices",
+                    data=json.dumps({
+                        "filter": {"visibility": "ALL"},
+                        "limit": 1000, "offset": price_offset
+                    }), timeout=30,
+                )
+                if not price_r.ok:
+                    break
+                price_json  = price_r.json()
+                price_items = (price_json.get("items")
+                               or price_json.get("result", {}).get("items", []))
+                for p in price_items:
+                    oid     = str(p.get("offer_id", ""))
+                    prod_id = str(p.get("product_id", ""))
+                    price_obj = p.get("price", {}) or {}
+                    price = float(
+                        p.get("marketing_price") or
+                        price_obj.get("marketing_price") or
+                        price_obj.get("price") or
+                        price_obj.get("min_price") or 0
+                    )
+                    if oid:
+                        price_by_offer[oid] = price
+                    if prod_id:
+                        price_by_sku[prod_id] = price
+                if len(price_items) < 1000:
+                    break
+                price_offset += 1000
 
         result = []
         for offer_id, info in sku_agg.items():
@@ -361,6 +397,7 @@ class OzonClient:
         Возвращает список: cluster, sku_id, sku_name, quantity, sum
         """
         rows = []
+        seen_postings = set()
         for status in ("awaiting_deliver", "delivering", "driver_pickup"):
             offset = 0
             while True:
@@ -379,10 +416,18 @@ class OzonClient:
                     break
                 postings = r.json().get("result", [])
                 for posting in postings:
+                    pid = posting.get("posting_number", "")
+                    if pid in seen_postings:
+                        continue
+                    seen_postings.add(pid)
+
                     analytics = posting.get("analytics_data", {}) or {}
                     cluster   = analytics.get("warehouse_name", "—")
                     fin       = posting.get("financial_data", {}) or {}
-                    products  = fin.get("products", posting.get("products", []))
+
+                    # Продукты: сначала на уровне posting, потом внутри financial_data
+                    products = posting.get("products") or fin.get("products") or []
+
                     for prod in products:
                         sku_id   = str(prod.get("offer_id", prod.get("sku", "")))
                         sku_name = prod.get("name", sku_id)
@@ -393,7 +438,7 @@ class OzonClient:
                             "sku_id":   sku_id,
                             "sku_name": sku_name,
                             "quantity": qty,
-                            "sum":      qty * price,
+                            "sum":      round(qty * price, 2),
                         })
                 if len(postings) < 1000:
                     break
@@ -401,15 +446,29 @@ class OzonClient:
         return rows
 
     def debug_prices(self, sample_offer_ids: list) -> dict:
-        """Диагностика: возвращает сырой ответ v5/product/info/prices для первых товаров."""
-        r = self.session.post(
-            f"{self.BASE_URL}/v5/product/info/prices",
-            data=json.dumps({
-                "filter": {"offer_id": sample_offer_ids[:10], "visibility": "ALL"},
-                "limit": 10, "offset": 0,
-            }), timeout=15,
-        )
-        return {"status": r.status_code, "body": r.json() if r.ok else r.text}
+        """Диагностика: пробует v4 и v5, возвращает сырые ответы."""
+        results = {}
+        for ver in ("v4", "v5"):
+            r = self.session.post(
+                f"{self.BASE_URL}/{ver}/product/info/prices",
+                data=json.dumps({
+                    "filter": {"offer_id": sample_offer_ids[:5], "visibility": "ALL"},
+                    "limit": 5, "offset": 0,
+                }), timeout=15,
+            )
+            body = r.json() if r.ok else r.text
+            # Находим items где бы они ни были
+            if isinstance(body, dict):
+                items = body.get("items") or body.get("result", {}).get("items", [])
+            else:
+                items = []
+            results[ver] = {
+                "status": r.status_code,
+                "items_count": len(items),
+                "first_item_keys": list(items[0].keys()) if items else [],
+                "first_item": items[0] if items else None,
+            }
+        return results
 
 
 
@@ -1349,20 +1408,17 @@ with wh_c2:
                     sample_ids = [it["sku_id"] for it in wh_items[:5]]
                     _client = OzonClient(client_id=client_id, api_key=api_key)
                     dbg = _client.debug_prices(sample_ids)
-                    st.caption(f"HTTP {dbg['status']} · offer_ids запрошены: {sample_ids}")
-                    body = dbg["body"]
-                    items_raw = body.get("result", {}).get("items", [])
-                    if items_raw:
-                        st.caption("Поля первого товара из ответа API:")
-                        first = items_raw[0]
-                        st.json({
-                            "offer_id":   first.get("offer_id"),
-                            "product_id": first.get("product_id"),
-                            "price":      first.get("price"),
-                        })
-                    else:
-                        st.warning("API вернул пустой список items. Полный ответ:")
-                        st.json(body)
+                    for ver, info in dbg.items():
+                        st.caption(f"**{ver}** · HTTP {info['status']} · items: {info['items_count']}")
+                        if info["first_item"]:
+                            st.json({
+                                "offer_id":    info["first_item"].get("offer_id"),
+                                "product_id":  info["first_item"].get("product_id"),
+                                "price_fields": {k: v for k, v in info["first_item"].items()
+                                                 if "price" in k.lower() or k == "marketing_price"},
+                            })
+                        else:
+                            st.warning(f"{ver}: items пустые. Ключи в ответе: {list(info.get('body', {}).keys()) if isinstance(info.get('body'), dict) else '—'}")
                 except Exception as _dbg_e:
                     st.error(f"Ошибка диагностики: {_dbg_e}")
     else:
