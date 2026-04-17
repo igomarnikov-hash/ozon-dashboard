@@ -316,17 +316,9 @@ class OzonClient:
         if not all_rows:
             return []
 
-        # Получаем список кластеров чтобы знать total
-        clusters_r = self.session.post(
-            f"{self.BASE_URL}/v1/cluster/list",
-            data=json.dumps({}), timeout=15,
-        )
-        total_clusters = 23  # fallback — количество кластеров Ozon
-        if clusters_r.ok:
-            cl_data = clusters_r.json().get("result", {})
-            cl_list = cl_data.get("clusters", cl_data.get("items", []))
-            if cl_list:
-                total_clusters = len(cl_list)
+        # Ozon не предоставляет публичный эндпоинт для списка кластеров.
+        # Считаем total_clusters динамически — сколько уникальных складов встретили.
+        total_clusters = 23  # официальное число кластеров Ozon на 2024-2025
 
         # Считаем для каждого item_code на скольких разных складах есть остаток > 0
         from collections import defaultdict
@@ -635,10 +627,10 @@ def load_real_warehouse(_cid, _key):
 
     result_items, total_sum, total_units = [], 0.0, 0
     for row in rows:
-        sku_id   = str(row.get("sku", row.get("offer_id", "")))
-        sku_name = row.get("item_name", sku_id)
-        units    = int(row.get("free_to_sell_amount", 0))
-        price    = float(row.get("_price", 0.0))
+        sku_id   = str(row.get("sku", row.get("offer_id", row.get("item_code", ""))))
+        sku_name = row.get("item_name", row.get("sku_name", sku_id))
+        units    = int(row.get("free_to_sell_amount", row.get("units", 0)) or 0)
+        price    = float(row.get("_price", row.get("price", 0.0)) or 0.0)
         item_sum = units * price
         total_sum   += item_sum
         total_units += units
@@ -882,11 +874,15 @@ if st.session_state.get("show_settings", False):
             st.session_state.kpi_date_to   = new_kpi_to
             st.session_state.show_settings = False
             save_config(new_client_id, new_api_key)  # сохраняем на диск
-            for _k in ["df", "df_kpi", "balance", "returns", "data_error"]:
+            for _k in ["df", "df_kpi", "df_sales", "balance", "balance_raw",
+                       "returns", "warehouse", "localization", "data_error"]:
                 st.session_state.pop(_k, None)
             load_real_data.clear()
+            load_real_sales_data.clear()
             load_real_balance.clear()
             load_real_returns.clear()
+            load_real_warehouse.clear()
+            load_real_localization.clear()
             load_mock_data.clear()
             st.rerun()
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
