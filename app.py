@@ -244,20 +244,23 @@ class OzonClient:
         if not all_rows:
             return []
 
-        # Агрегируем по item_code (offer_id продавца)
+        # Агрегируем по item_code (offer_id продавца), сохраняем числовой sku
         sku_agg: dict = {}
         for row in all_rows:
             offer_id = str(row.get("item_code", ""))
+            sku_int  = str(row.get("sku", ""))          # числовой Ozon SKU
             sku_name = row.get("item_name", offer_id)
             units    = int(row.get("free_to_sell_amount", 0) or 0)
             if not offer_id:
                 continue
             if offer_id not in sku_agg:
-                sku_agg[offer_id] = {"sku_name": sku_name, "units": 0}
+                sku_agg[offer_id] = {"sku_name": sku_name, "units": 0, "sku_int": sku_int}
             sku_agg[offer_id]["units"] += units
 
-        # Шаг 2: цены — filter обязателен для v5/product/info/prices
-        price_map: dict = {}
+        # Шаг 2: цены из v5/product/info/prices
+        # Строим два индекса: по offer_id и по числовому product_id/sku
+        price_by_offer: dict = {}
+        price_by_sku:   dict = {}
         price_offset = 0
         while True:
             price_r = self.session.post(
@@ -271,24 +274,34 @@ class OzonClient:
                 break
             price_items = price_r.json().get("result", {}).get("items", [])
             for p in price_items:
-                oid = str(p.get("offer_id", ""))
-                # price.price — основная цена продавца
+                oid       = str(p.get("offer_id", ""))
+                prod_id   = str(p.get("product_id", ""))
                 price_obj = p.get("price", {}) or {}
-                price = float(price_obj.get("price", 0) or
-                              price_obj.get("min_price", 0) or 0)
+                # Берём selling_price → price → min_price (приоритет по убыванию)
+                price = float(
+                    price_obj.get("selling_price") or
+                    price_obj.get("price") or
+                    price_obj.get("min_price") or 0
+                )
                 if oid:
-                    price_map[oid] = price
+                    price_by_offer[oid] = price
+                if prod_id:
+                    price_by_sku[prod_id] = price
             if len(price_items) < 1000:
                 break
             price_offset += 1000
 
         result = []
         for offer_id, info in sku_agg.items():
+            # Ищем цену сначала по offer_id, затем по числовому sku
+            price = (price_by_offer.get(offer_id)
+                     or price_by_sku.get(info["sku_int"])
+                     or 0.0)
             result.append({
                 "sku":                 offer_id,
                 "item_name":           info["sku_name"],
                 "free_to_sell_amount": info["units"],
-                "_price":              price_map.get(offer_id, 0.0),
+                "_price":              price,
             })
         return result
 
@@ -342,10 +355,50 @@ class OzonClient:
             })
         return sorted(result, key=lambda x: x["clusters"], reverse=True)
 
+    def get_supply_in_transit(self):
+        """
+        POST /v1/supply-order/list — поставки FBO в пути (статус IN_TRANSIT / ACCEPTED).
+        Возвращает список: cluster, sku_id, sku_name, quantity, total_sum
+        """
+        all_orders, offset = [], 0
+        while True:
+            payload = {
+                "filter": {"states": ["IN_TRANSIT", "ACCEPTED", "DELIVERING"]},
+                "limit": 50, "offset": offset,
+            }
+            r = self.session.post(
+                f"{self.BASE_URL}/v1/supply-order/list",
+                data=json.dumps(payload), timeout=30,
+            )
+            if not r.ok:
+                break
+            items = r.json().get("result", {}).get("supply_orders", [])
+            all_orders.extend(items)
+            if len(items) < 50:
+                break
+            offset += 50
 
-# ─────────────────────────────────────────────
-# DATA TRANSFORMATION
-# ─────────────────────────────────────────────
+        rows = []
+        for order in all_orders:
+            cluster   = order.get("cluster_name", order.get("warehouse_name", "—"))
+            order_sum = float(order.get("total_price", order.get("supply_price", 0)) or 0)
+            for item in order.get("items", []):
+                sku_id   = str(item.get("offer_id", item.get("sku", "")))
+                sku_name = item.get("name", sku_id)
+                qty      = int(item.get("quantity", 0) or 0)
+                price    = float(item.get("price", 0) or 0)
+                item_sum = qty * price if price else 0.0
+                rows.append({
+                    "cluster":  cluster,
+                    "sku_id":   sku_id,
+                    "sku_name": sku_name,
+                    "quantity": qty,
+                    "sum":      item_sum,
+                })
+        return rows
+
+
+
 METRIC_KEYS       = ["revenue", "ordered_units", "hits_view", "session_view"]
 SALES_METRIC_KEYS = ["revenue", "ordered_units", "delivered_units", "hits_view", "session_view"]
 
@@ -435,6 +488,14 @@ MOCK_LOCALIZATION = [
     {"sku_id": "101008", "sku_name": "Умная колонка Яндекс Макс",     "clusters": 7},
 ]
 TOTAL_CLUSTERS = 23
+
+MOCK_SUPPLY_IN_TRANSIT = [
+    {"cluster": "Москва (Хоругвино)", "sku_id": "AT26011", "sku_name": "AromaTec Ароматизатор, Новая машина",    "quantity": 500, "sum": 35_000.0},
+    {"cluster": "Москва (Хоругвино)", "sku_id": "AT26012", "sku_name": "AromaTec Ароматизатор, Хвойный лес",     "quantity": 300, "sum": 21_000.0},
+    {"cluster": "Санкт-Петербург",    "sku_id": "AT26013", "sku_name": "AromaTec Ароматизатор, Черный лед",      "quantity": 200, "sum": 14_000.0},
+    {"cluster": "Екатеринбург",       "sku_id": "AT26015", "sku_name": "AromaTec Ароматизатор, Пряная вишня",    "quantity": 150, "sum": 10_500.0},
+    {"cluster": "Новосибирск",        "sku_id": "AT26016", "sku_name": "AromaTec Ароматизатор, Пина Колада",     "quantity": 250, "sum": 17_500.0},
+]
 
 
 def generate_mock_data(date_from: date, date_to: date) -> pd.DataFrame:
@@ -653,8 +714,15 @@ def load_real_localization(_cid, _key):
     return items
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_mock_data(df, dt):
+@st.cache_data(ttl=600, show_spinner=False)
+def load_real_supply_in_transit(_cid, _key):
+    """Загружает поставки FBO в пути."""
+    client = OzonClient(client_id=_cid, api_key=_key)
+    items = client.get_supply_in_transit()
+    return items if items else MOCK_SUPPLY_IN_TRANSIT
+
+
+
     return generate_mock_data(df, dt)
 
 
@@ -678,6 +746,7 @@ if "df" not in st.session_state or fetch_btn:
                 st.session_state.returns      = MOCK_RETURNS
                 st.session_state.warehouse    = MOCK_WAREHOUSE
                 st.session_state.localization = MOCK_LOCALIZATION
+                st.session_state.supply_in_transit = MOCK_SUPPLY_IN_TRANSIT
                 st.session_state.data_error   = None
             else:
                 df_str  = date_from.strftime("%Y-%m-%d")
@@ -721,6 +790,10 @@ if "df" not in st.session_state or fetch_btn:
                     st.session_state.localization = load_real_localization(client_id, api_key)
                 except Exception:
                     st.session_state.localization = MOCK_LOCALIZATION
+                try:
+                    st.session_state.supply_in_transit = load_real_supply_in_transit(client_id, api_key)
+                except Exception:
+                    st.session_state.supply_in_transit = MOCK_SUPPLY_IN_TRANSIT
                 st.session_state.data_error = None
         except Exception as e:
             st.session_state.data_error   = str(e)
@@ -732,6 +805,7 @@ if "df" not in st.session_state or fetch_btn:
             st.session_state.returns      = MOCK_RETURNS
             st.session_state.warehouse    = MOCK_WAREHOUSE
             st.session_state.localization = MOCK_LOCALIZATION
+            st.session_state.supply_in_transit = MOCK_SUPPLY_IN_TRANSIT
             USE_MOCK = True
 
 df: pd.DataFrame     = st.session_state.df
@@ -741,6 +815,7 @@ balance: float       = st.session_state.get("balance", 0.0)
 returns: dict        = st.session_state.get("returns", MOCK_RETURNS)
 warehouse: dict      = st.session_state.get("warehouse", MOCK_WAREHOUSE)
 localization: list   = st.session_state.get("localization", MOCK_LOCALIZATION)
+supply_in_transit: list = st.session_state.get("supply_in_transit", MOCK_SUPPLY_IN_TRANSIT)
 
 for col in METRIC_KEYS:
     if col not in df.columns:
@@ -883,6 +958,7 @@ if st.session_state.get("show_settings", False):
             load_real_returns.clear()
             load_real_warehouse.clear()
             load_real_localization.clear()
+            load_real_supply_in_transit.clear()
             load_mock_data.clear()
             st.rerun()
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
@@ -1296,6 +1372,59 @@ if localization:
     st.markdown('</div>', unsafe_allow_html=True)
 else:
     st.info("Нет данных об уровне локализации")
+
+# ─────────────────────────────────────────────
+# SUPPLY IN TRANSIT
+# ─────────────────────────────────────────────
+st.markdown('<div class="section-title">🚚 Товары в пути</div>', unsafe_allow_html=True)
+
+if supply_in_transit:
+    sit_df = pd.DataFrame(supply_in_transit)
+
+    # Итоговая сумма
+    total_transit_sum   = sit_df["sum"].sum()
+    total_transit_units = sit_df["quantity"].sum()
+
+    sit_c1, sit_c2 = st.columns([1, 3], gap="large")
+
+    with sit_c1:
+        transit_sum_fmt   = f"₽{total_transit_sum:,.0f}".replace(",", " ")
+        transit_units_fmt = f"{total_transit_units:,} шт".replace(",", " ")
+        sit_c1.markdown(f"""
+            <div class="metric-card card-orders" style="height:auto">
+              <div class="metric-label">🚚 Итого в пути</div>
+              <div class="metric-row">
+                <span class="metric-main">{transit_sum_fmt}</span>
+              </div>
+              <div style="font-size:14px;color:#c8d0ee;margin:6px 0">/</div>
+              <div class="metric-sub">{transit_units_fmt}</div>
+              <div class="metric-delta delta-neu" style="margin-top:8px">
+                {sit_df['cluster'].nunique()} кластер(-ов) · {len(sit_df)} позиций
+              </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    with sit_c2:
+        sit_disp = sit_df.copy()
+        sit_disp["sum_fmt"] = sit_disp["sum"].apply(
+            lambda x: f"₽{x:,.0f}".replace(",", " ") if x else "—"
+        )
+        sit_disp["qty_fmt"] = sit_disp["quantity"].apply(lambda x: f"{x:,} шт".replace(",", " "))
+        sit_disp = sit_disp[["cluster", "sku_id", "sku_name", "qty_fmt", "sum_fmt"]].rename(columns={
+            "cluster": "Кластер", "sku_id": "SKU",
+            "sku_name": "Товар", "qty_fmt": "Количество", "sum_fmt": "Сумма поставки",
+        })
+        st.dataframe(sit_disp, use_container_width=True, height=320)
+
+        # Итоговая строка
+        st.markdown(
+            f'<div style="text-align:right;font-size:13px;color:#5a6a9a;margin-top:6px">'
+            f'Итого: <strong style="color:#1a2040">{transit_sum_fmt}</strong> · '
+            f'{transit_units_fmt}</div>',
+            unsafe_allow_html=True,
+        )
+else:
+    st.info("Нет данных о поставках в пути")
 
 # ─────────────────────────────────────────────
 # FOOTER
