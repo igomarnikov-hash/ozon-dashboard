@@ -388,56 +388,57 @@ class OzonClient:
 
     def get_supply_in_transit(self):
         """
-        POST /v2/posting/fbo/list — FBO отправления в статусе awaiting_deliver / delivering.
-        Возвращает список: cluster, sku_id, sku_name, quantity, sum
+        POST /v2/supply-order/list — поставки продавца на склад Ozon (кросс-докинг).
+        Статусы в пути: SUPPLY_VARIATIONS_CREATED, ACCEPTED_AT_SUPPLY_WAREHOUSE,
+                        DELIVERING_TO_DESTINATION_WAREHOUSE
         """
+        IN_TRANSIT_STATUSES = {
+            "SUPPLY_VARIATIONS_CREATED",
+            "ACCEPTED_AT_SUPPLY_WAREHOUSE",
+            "DELIVERING_TO_DESTINATION_WAREHOUSE",
+            "CREATED",
+            "APPROVED",
+        }
         rows = []
-        seen_postings = set()
-        for status in ("awaiting_deliver", "delivering", "driver_pickup"):
-            offset = 0
-            while True:
-                payload = {
-                    "dir": "asc",
-                    "filter": {"status": status},
-                    "limit": 1000,
-                    "offset": offset,
-                    "with": {"financial_data": True, "analytics_data": True},
-                }
-                r = self.session.post(
-                    f"{self.BASE_URL}/v2/posting/fbo/list",
-                    data=json.dumps(payload), timeout=30,
+        page = 1
+        while True:
+            payload = {"page": page, "page_size": 50}
+            r = self.session.post(
+                f"{self.BASE_URL}/v2/supply-order/list",
+                data=json.dumps(payload), timeout=30,
+            )
+            if not r.ok:
+                break
+            data   = r.json()
+            orders = data.get("supply_orders", data.get("result", {}).get("supply_orders", []))
+            if not orders:
+                break
+            for order in orders:
+                status = order.get("status", "")
+                if status not in IN_TRANSIT_STATUSES:
+                    continue
+                supply_id = str(order.get("supply_order_id", order.get("id", "")))
+                cluster   = order.get(
+                    "destination_place_name",
+                    order.get("warehouse_name", order.get("destination_warehouse", "—"))
                 )
-                if not r.ok:
-                    break
-                postings = r.json().get("result", [])
-                for posting in postings:
-                    pid = posting.get("posting_number", "")
-                    if pid in seen_postings:
-                        continue
-                    seen_postings.add(pid)
-
-                    analytics = posting.get("analytics_data", {}) or {}
-                    cluster   = analytics.get("warehouse_name", "—")
-                    fin       = posting.get("financial_data", {}) or {}
-
-                    # Продукты: сначала на уровне posting, потом внутри financial_data
-                    products = posting.get("products") or fin.get("products") or []
-
-                    for prod in products:
-                        sku_id   = str(prod.get("offer_id", prod.get("sku", "")))
-                        sku_name = prod.get("name", sku_id)
-                        qty      = int(prod.get("quantity", 0) or 0)
-                        price    = float(prod.get("price", 0) or 0)
-                        rows.append({
-                            "cluster":  cluster,
-                            "sku_id":   sku_id,
-                            "sku_name": sku_name,
-                            "quantity": qty,
-                            "sum":      round(qty * price, 2),
-                        })
-                if len(postings) < 1000:
-                    break
-                offset += 1000
+                for item in order.get("items", order.get("supply_order_items", [])):
+                    sku_id   = str(item.get("offer_id", item.get("sku", "")))
+                    sku_name = item.get("name", item.get("product_name", sku_id))
+                    qty      = int(item.get("quantity", item.get("quantity_accepted", 0)) or 0)
+                    price    = float(item.get("price", item.get("item_price", 0)) or 0)
+                    rows.append({
+                        "supply_id": supply_id,
+                        "cluster":   cluster,
+                        "sku_id":    sku_id,
+                        "sku_name":  sku_name,
+                        "quantity":  qty,
+                        "sum":       round(qty * price, 2),
+                    })
+            total_pages = data.get("total_pages", data.get("result", {}).get("total_pages", 1))
+            if page >= total_pages:
+                break
+            page += 1
         return rows
 
     def debug_prices(self, sample_offer_ids: list) -> dict:
@@ -560,11 +561,11 @@ MOCK_LOCALIZATION = [
 TOTAL_CLUSTERS = 23
 
 MOCK_SUPPLY_IN_TRANSIT = [
-    {"cluster": "Москва (Хоругвино)", "sku_id": "AT26011", "sku_name": "AromaTec Ароматизатор, Новая машина",    "quantity": 500, "sum": 35_000.0},
-    {"cluster": "Москва (Хоругвино)", "sku_id": "AT26012", "sku_name": "AromaTec Ароматизатор, Хвойный лес",     "quantity": 300, "sum": 21_000.0},
-    {"cluster": "Санкт-Петербург",    "sku_id": "AT26013", "sku_name": "AromaTec Ароматизатор, Черный лед",      "quantity": 200, "sum": 14_000.0},
-    {"cluster": "Екатеринбург",       "sku_id": "AT26015", "sku_name": "AromaTec Ароматизатор, Пряная вишня",    "quantity": 150, "sum": 10_500.0},
-    {"cluster": "Новосибирск",        "sku_id": "AT26016", "sku_name": "AromaTec Ароматизатор, Пина Колада",     "quantity": 250, "sum": 17_500.0},
+    {"supply_id": "2000049302416", "cluster": "ТВЕРЬ_РФЦ",           "sku_id": "AT26011", "sku_name": "AromaTec Ароматизатор, Новая машина",  "quantity": 50,  "sum": 5_900.0},
+    {"supply_id": "2000049302259", "cluster": "НИЖНИЙ_НОВГОРОД_2_РФЦ","sku_id": "AT26012", "sku_name": "AromaTec Ароматизатор, Хвойный лес",   "quantity": 50,  "sum": 7_400.0},
+    {"supply_id": "2000049298069", "cluster": "САНКТ-ПЕТЕРБУРГ_РФЦ",  "sku_id": "AT26013", "sku_name": "AromaTec Ароматизатор, Черный лед",    "quantity": 34,  "sum": 8_738.0},
+    {"supply_id": "2000049297535", "cluster": "ЯРОСЛАВЛЬ_РФЦ",        "sku_id": "AT26015", "sku_name": "AromaTec Ароматизатор, Пряная вишня",  "quantity": 13,  "sum": 1_534.0},
+    {"supply_id": "2000049285891", "cluster": "НИЖНИЙ_НОВГОРОД_2_РФЦ","sku_id": "AT26016", "sku_name": "AromaTec Ароматизатор, Пина Колада",   "quantity": 25,  "sum": 5_300.0},
 ]
 
 
@@ -1481,6 +1482,7 @@ if supply_in_transit:
     with sit_c1:
         transit_sum_fmt   = f"₽{total_transit_sum:,.0f}".replace(",", " ")
         transit_units_fmt = f"{total_transit_units:,} шт".replace(",", " ")
+        n_orders = sit_df["supply_id"].nunique() if "supply_id" in sit_df.columns else "—"
         sit_c1.markdown(f"""
             <div class="metric-card card-orders" style="height:auto">
               <div class="metric-label">🚚 Итого в пути</div>
@@ -1490,7 +1492,7 @@ if supply_in_transit:
               <div style="font-size:14px;color:#c8d0ee;margin:6px 0">/</div>
               <div class="metric-sub">{transit_units_fmt}</div>
               <div class="metric-delta delta-neu" style="margin-top:8px">
-                {sit_df['cluster'].nunique()} кластер(-ов) · {len(sit_df)} позиций
+                {n_orders} поставок · {sit_df['cluster'].nunique()} кластеров
               </div>
             </div>
         """, unsafe_allow_html=True)
@@ -1501,8 +1503,10 @@ if supply_in_transit:
             lambda x: f"₽{x:,.0f}".replace(",", " ") if x else "—"
         )
         sit_disp["qty_fmt"] = sit_disp["quantity"].apply(lambda x: f"{x:,} шт".replace(",", " "))
-        sit_disp = sit_disp[["cluster", "sku_id", "sku_name", "qty_fmt", "sum_fmt"]].rename(columns={
-            "cluster": "Кластер", "sku_id": "SKU",
+        cols_order = ["supply_id", "cluster", "sku_id", "sku_name", "qty_fmt", "sum_fmt"]
+        cols_present = [c for c in cols_order if c in sit_disp.columns]
+        sit_disp = sit_disp[cols_present].rename(columns={
+            "supply_id": "№ поставки", "cluster": "Кластер", "sku_id": "SKU",
             "sku_name": "Товар", "qty_fmt": "Количество", "sum_fmt": "Сумма поставки",
         })
         st.dataframe(sit_disp, use_container_width=True, height=320)
