@@ -443,13 +443,11 @@ class OzonClient:
         return rows
 
     def debug_supply(self) -> dict:
-        """Диагностика: перебирает все известные эндпоинты поставок."""
+        """Диагностика: показывает полный ответ для supply-order/list."""
         results = {}
         endpoints = [
             ("/v2/supply-order/list",  {"limit": 5}),
-            ("/v1/supply-order/list",  {"limit": 5}),
-            ("/v1/supply-order/get",   {"supply_order_id": 0}),
-            ("/v2/supply-order/get",   {"supply_order_id": 0}),
+            ("/v1/supply-order/list",  {"limit": 5, "last_id": ""}),
         ]
         for path, payload in endpoints:
             try:
@@ -457,16 +455,13 @@ class OzonClient:
                     f"{self.BASE_URL}{path}",
                     data=json.dumps(payload), timeout=10,
                 )
-                body = r.json() if r.ok else {"error": r.text[:200]}
-                orders = []
-                if isinstance(body, dict):
-                    orders = (body.get("supply_orders")
-                              or body.get("result", {}).get("supply_orders", [])
-                              or [])
+                try:
+                    body = r.json()
+                except Exception:
+                    body = r.text[:500]
                 results[path] = {
-                    "status": r.status_code,
-                    "orders_count": len(orders),
-                    "top_keys": list(body.keys()) if isinstance(body, dict) else [],
+                    "status":   r.status_code,
+                    "response": body,
                 }
             except Exception as e:
                 results[path] = {"error": str(e)}
@@ -1502,19 +1497,15 @@ else:
 # ─────────────────────────────────────────────
 st.markdown('<div class="section-title">🚚 Товары в пути</div>', unsafe_allow_html=True)
 
-# Диагностика если данные mock
-if not USE_MOCK:
-    _is_mock_supply = supply_in_transit and supply_in_transit[0].get("supply_id") in {
-        s["supply_id"] for s in MOCK_SUPPLY_IN_TRANSIT
-    }
-    if _is_mock_supply:
-        with st.expander("🔍 Диагностика поставок — API вернул mock", expanded=True):
-            try:
-                _c = OzonClient(client_id=client_id, api_key=api_key)
-                dbg = _c.debug_supply()
-                st.json(dbg)
-            except Exception as _e:
-                st.error(str(_e))
+_is_mock_supply = (not supply_in_transit) or (supply_in_transit and supply_in_transit[0].get("supply_id") in {s["supply_id"] for s in MOCK_SUPPLY_IN_TRANSIT})
+
+if not USE_MOCK and _is_mock_supply:
+    with st.expander("🔍 Диагностика поставок", expanded=True):
+        try:
+            _c = OzonClient(client_id=client_id, api_key=api_key)
+            st.json(_c.debug_supply())
+        except Exception as _e:
+            st.error(str(_e))
 
 if supply_in_transit:
     sit_df = pd.DataFrame(supply_in_transit)
