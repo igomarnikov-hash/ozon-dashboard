@@ -388,16 +388,12 @@ class OzonClient:
 
     def get_supply_in_transit(self):
         """
-        POST /v2/supply-order/list — поставки продавца на склад Ozon (кросс-докинг).
-        Статусы в пути: SUPPLY_VARIATIONS_CREATED, ACCEPTED_AT_SUPPLY_WAREHOUSE,
-                        DELIVERING_TO_DESTINATION_WAREHOUSE
+        POST /v2/supply-order/list — все поставки продавца на склад Ozon.
+        Берём все записи без фильтра по статусу, затем исключаем финальные.
         """
-        IN_TRANSIT_STATUSES = {
-            "SUPPLY_VARIATIONS_CREATED",
-            "ACCEPTED_AT_SUPPLY_WAREHOUSE",
-            "DELIVERING_TO_DESTINATION_WAREHOUSE",
-            "CREATED",
-            "APPROVED",
+        FINAL_STATUSES = {
+            "ACCEPTED", "COMPLETED", "CANCELLED", "REJECTED",
+            "DELIVERED", "CLOSED", "SUPPLY_ACCEPTED",
         }
         rows = []
         page = 1
@@ -410,32 +406,35 @@ class OzonClient:
             if not r.ok:
                 break
             data   = r.json()
-            orders = data.get("supply_orders", data.get("result", {}).get("supply_orders", []))
+            orders = (data.get("supply_orders")
+                      or data.get("result", {}).get("supply_orders", []))
             if not orders:
                 break
             for order in orders:
-                status = order.get("status", "")
-                if status not in IN_TRANSIT_STATUSES:
+                status    = order.get("status", "")
+                if status in FINAL_STATUSES:
                     continue
                 supply_id = str(order.get("supply_order_id", order.get("id", "")))
-                cluster   = order.get(
-                    "destination_place_name",
-                    order.get("warehouse_name", order.get("destination_warehouse", "—"))
-                )
-                for item in order.get("items", order.get("supply_order_items", [])):
+                cluster   = (order.get("destination_place_name")
+                             or order.get("warehouse_name")
+                             or order.get("destination_warehouse", "—"))
+                for item in (order.get("items") or order.get("supply_order_items", [])):
                     sku_id   = str(item.get("offer_id", item.get("sku", "")))
                     sku_name = item.get("name", item.get("product_name", sku_id))
                     qty      = int(item.get("quantity", item.get("quantity_accepted", 0)) or 0)
                     price    = float(item.get("price", item.get("item_price", 0)) or 0)
                     rows.append({
                         "supply_id": supply_id,
+                        "status":    status,
                         "cluster":   cluster,
                         "sku_id":    sku_id,
                         "sku_name":  sku_name,
                         "quantity":  qty,
                         "sum":       round(qty * price, 2),
                     })
-            total_pages = data.get("total_pages", data.get("result", {}).get("total_pages", 1))
+            total_pages = (data.get("total_pages")
+                           or data.get("result", {}).get("total_pages", 1)
+                           or 1)
             if page >= total_pages:
                 break
             page += 1
@@ -1503,10 +1502,10 @@ if supply_in_transit:
             lambda x: f"₽{x:,.0f}".replace(",", " ") if x else "—"
         )
         sit_disp["qty_fmt"] = sit_disp["quantity"].apply(lambda x: f"{x:,} шт".replace(",", " "))
-        cols_order = ["supply_id", "cluster", "sku_id", "sku_name", "qty_fmt", "sum_fmt"]
+        cols_order = ["supply_id", "status", "cluster", "sku_id", "sku_name", "qty_fmt", "sum_fmt"]
         cols_present = [c for c in cols_order if c in sit_disp.columns]
         sit_disp = sit_disp[cols_present].rename(columns={
-            "supply_id": "№ поставки", "cluster": "Кластер", "sku_id": "SKU",
+            "supply_id": "№ поставки", "status": "Статус", "cluster": "Кластер", "sku_id": "SKU",
             "sku_name": "Товар", "qty_fmt": "Количество", "sum_fmt": "Сумма поставки",
         })
         st.dataframe(sit_disp, use_container_width=True, height=320)
