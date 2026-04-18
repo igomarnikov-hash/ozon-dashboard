@@ -443,27 +443,34 @@ class OzonClient:
         return rows
 
     def debug_supply(self) -> dict:
-        """Диагностика: возвращает сырой ответ первой страницы supply-order/list."""
-        r = self.session.post(
-            f"{self.BASE_URL}/v2/supply-order/list",
-            data=json.dumps({"limit": 5}), timeout=15,
-        )
-        body = r.json() if r.ok else r.text
-        orders = []
-        if isinstance(body, dict):
-            orders = (body.get("supply_orders")
-                      or body.get("result", {}).get("supply_orders", []))
-        return {
-            "status":        r.status_code,
-            "top_keys":      list(body.keys()) if isinstance(body, dict) else [],
-            "orders_count":  len(orders),
-            "has_next":      body.get("has_next") if isinstance(body, dict) else "?",
-            "last_id":       body.get("last_id") if isinstance(body, dict) else "?",
-            "first_order":   {k: v for k, v in orders[0].items()
-                              if k not in ("items", "supply_order_items")} if orders else None,
-            "first_order_items_count": len(orders[0].get("items", orders[0].get("supply_order_items", []))) if orders else 0,
-            "first_item_sample": (orders[0].get("items", orders[0].get("supply_order_items", [{}]))[0] if orders else None),
-        }
+        """Диагностика: перебирает все известные эндпоинты поставок."""
+        results = {}
+        endpoints = [
+            ("/v2/supply-order/list",  {"limit": 5}),
+            ("/v1/supply-order/list",  {"limit": 5}),
+            ("/v1/supply-order/get",   {"supply_order_id": 0}),
+            ("/v2/supply-order/get",   {"supply_order_id": 0}),
+        ]
+        for path, payload in endpoints:
+            try:
+                r = self.session.post(
+                    f"{self.BASE_URL}{path}",
+                    data=json.dumps(payload), timeout=10,
+                )
+                body = r.json() if r.ok else {"error": r.text[:200]}
+                orders = []
+                if isinstance(body, dict):
+                    orders = (body.get("supply_orders")
+                              or body.get("result", {}).get("supply_orders", [])
+                              or [])
+                results[path] = {
+                    "status": r.status_code,
+                    "orders_count": len(orders),
+                    "top_keys": list(body.keys()) if isinstance(body, dict) else [],
+                }
+            except Exception as e:
+                results[path] = {"error": str(e)}
+        return results
 
 
         """Диагностика: пробует v4 и v5, возвращает сырые ответы."""
