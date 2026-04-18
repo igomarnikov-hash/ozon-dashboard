@@ -388,17 +388,19 @@ class OzonClient:
 
     def get_supply_in_transit(self):
         """
-        POST /v2/supply-order/list — все поставки продавца на склад Ozon.
-        Берём все записи без фильтра по статусу, затем исключаем финальные.
+        POST /v2/supply-order/list — поставки продавца на склад Ozon.
+        Пагинация через last_id + limit (cursor-based).
         """
         FINAL_STATUSES = {
-            "ACCEPTED", "COMPLETED", "CANCELLED", "REJECTED",
-            "DELIVERED", "CLOSED", "SUPPLY_ACCEPTED",
+            "SUPPLY_ACCEPTED", "COMPLETED", "CANCELLED",
+            "REJECTED", "CLOSED", "DELIVERED",
         }
         rows = []
-        page = 1
+        last_id = ""
         while True:
-            payload = {"page": page, "page_size": 50}
+            payload = {"limit": 50}
+            if last_id:
+                payload["last_id"] = last_id
             r = self.session.post(
                 f"{self.BASE_URL}/v2/supply-order/list",
                 data=json.dumps(payload), timeout=30,
@@ -432,19 +434,19 @@ class OzonClient:
                         "quantity":  qty,
                         "sum":       round(qty * price, 2),
                     })
-            total_pages = (data.get("total_pages")
-                           or data.get("result", {}).get("total_pages", 1)
-                           or 1)
-            if page >= total_pages:
+            # Cursor для следующей страницы
+            last_id = (data.get("last_id")
+                       or data.get("result", {}).get("last_id", ""))
+            has_next = data.get("has_next", data.get("result", {}).get("has_next", False))
+            if not has_next or not last_id:
                 break
-            page += 1
         return rows
 
     def debug_supply(self) -> dict:
         """Диагностика: возвращает сырой ответ первой страницы supply-order/list."""
         r = self.session.post(
             f"{self.BASE_URL}/v2/supply-order/list",
-            data=json.dumps({"page": 1, "page_size": 5}), timeout=15,
+            data=json.dumps({"limit": 5}), timeout=15,
         )
         body = r.json() if r.ok else r.text
         orders = []
@@ -452,16 +454,15 @@ class OzonClient:
             orders = (body.get("supply_orders")
                       or body.get("result", {}).get("supply_orders", []))
         return {
-            "status":       r.status_code,
-            "top_keys":     list(body.keys()) if isinstance(body, dict) else [],
-            "orders_count": len(orders),
-            "total_pages":  (body.get("total_pages")
-                             or body.get("result", {}).get("total_pages", "?")
-                             if isinstance(body, dict) else "?"),
-            "first_order":  {k: v for k, v in orders[0].items()
-                             if k not in ("items", "supply_order_items")} if orders else None,
+            "status":        r.status_code,
+            "top_keys":      list(body.keys()) if isinstance(body, dict) else [],
+            "orders_count":  len(orders),
+            "has_next":      body.get("has_next") if isinstance(body, dict) else "?",
+            "last_id":       body.get("last_id") if isinstance(body, dict) else "?",
+            "first_order":   {k: v for k, v in orders[0].items()
+                              if k not in ("items", "supply_order_items")} if orders else None,
             "first_order_items_count": len(orders[0].get("items", orders[0].get("supply_order_items", []))) if orders else 0,
-            "first_order_item_sample": (orders[0].get("items", orders[0].get("supply_order_items", [{}]))[0] if orders else None),
+            "first_item_sample": (orders[0].get("items", orders[0].get("supply_order_items", [{}]))[0] if orders else None),
         }
 
 
