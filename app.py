@@ -1508,7 +1508,7 @@ if supply_in_transit:
             "supply_id": "№ поставки", "status": "Статус", "cluster": "Кластер", "sku_id": "SKU",
             "sku_name": "Товар", "qty_fmt": "Количество", "sum_fmt": "Сумма поставки",
         })
-        st.dataframe(sit_disp, use_container_width=True, height=320)
+        st.dataframe(sit_disp.reset_index(drop=True).rename(lambda x: x+1), use_container_width=True, height=320)
 
         # Итоговая строка
         st.markdown(
