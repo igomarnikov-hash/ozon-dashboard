@@ -440,7 +440,31 @@ class OzonClient:
             page += 1
         return rows
 
-    def debug_prices(self, sample_offer_ids: list) -> dict:
+    def debug_supply(self) -> dict:
+        """Диагностика: возвращает сырой ответ первой страницы supply-order/list."""
+        r = self.session.post(
+            f"{self.BASE_URL}/v2/supply-order/list",
+            data=json.dumps({"page": 1, "page_size": 5}), timeout=15,
+        )
+        body = r.json() if r.ok else r.text
+        orders = []
+        if isinstance(body, dict):
+            orders = (body.get("supply_orders")
+                      or body.get("result", {}).get("supply_orders", []))
+        return {
+            "status":       r.status_code,
+            "top_keys":     list(body.keys()) if isinstance(body, dict) else [],
+            "orders_count": len(orders),
+            "total_pages":  (body.get("total_pages")
+                             or body.get("result", {}).get("total_pages", "?")
+                             if isinstance(body, dict) else "?"),
+            "first_order":  {k: v for k, v in orders[0].items()
+                             if k not in ("items", "supply_order_items")} if orders else None,
+            "first_order_items_count": len(orders[0].get("items", orders[0].get("supply_order_items", []))) if orders else 0,
+            "first_order_item_sample": (orders[0].get("items", orders[0].get("supply_order_items", [{}]))[0] if orders else None),
+        }
+
+
         """Диагностика: пробует v4 и v5, возвращает сырые ответы."""
         results = {}
         for ver in ("v4", "v5"):
@@ -792,7 +816,8 @@ def load_real_supply_in_transit(_cid, _key):
     return items if items else MOCK_SUPPLY_IN_TRANSIT
 
 
-
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_mock_data(df, dt):
     return generate_mock_data(df, dt)
 
 
@@ -1468,6 +1493,20 @@ else:
 # SUPPLY IN TRANSIT
 # ─────────────────────────────────────────────
 st.markdown('<div class="section-title">🚚 Товары в пути</div>', unsafe_allow_html=True)
+
+# Диагностика если данные mock
+if not USE_MOCK:
+    _is_mock_supply = supply_in_transit and supply_in_transit[0].get("supply_id") in {
+        s["supply_id"] for s in MOCK_SUPPLY_IN_TRANSIT
+    }
+    if _is_mock_supply:
+        with st.expander("🔍 Диагностика поставок — API вернул mock", expanded=True):
+            try:
+                _c = OzonClient(client_id=client_id, api_key=api_key)
+                dbg = _c.debug_supply()
+                st.json(dbg)
+            except Exception as _e:
+                st.error(str(_e))
 
 if supply_in_transit:
     sit_df = pd.DataFrame(supply_in_transit)
