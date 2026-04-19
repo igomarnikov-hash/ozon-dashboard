@@ -388,84 +388,93 @@ class OzonClient:
 
     def get_supply_in_transit(self):
         """
-        POST /v2/supply-order/list — поставки продавца на склад Ozon.
-        Пагинация через last_id + limit (cursor-based).
+        Получаем поставки через отчёт /v1/report/supply-orders/create,
+        затем читаем результат через /v1/report/info.
+        Параллельно пробуем /v2/supply-order/get по известным ID из отчёта.
         """
+        import time
+
         FINAL_STATUSES = {
             "SUPPLY_ACCEPTED", "COMPLETED", "CANCELLED",
             "REJECTED", "CLOSED", "DELIVERED",
         }
-        rows = []
-        last_id = ""
-        while True:
-            payload = {"limit": 50}
-            if last_id:
-                payload["last_id"] = last_id
-            r = self.session.post(
-                f"{self.BASE_URL}/v2/supply-order/list",
-                data=json.dumps(payload), timeout=30,
+
+        # Шаг 1: запрос отчёта по поставкам
+        now = datetime.now()
+        r = self.session.post(
+            f"{self.BASE_URL}/v1/report/supply-orders/create",
+            data=json.dumps({
+                "date_from": (now - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z"),
+                "date_to":    now.strftime("%Y-%m-%dT23:59:59Z"),
+                "language":  "DEFAULT",
+            }), timeout=30,
+        )
+        if not r.ok:
+            return []
+
+        code = r.json().get("result", {}).get("code", "")
+        if not code:
+            return []
+
+        # Шаг 2: ждём готовности отчёта (до 30 сек)
+        report_url = None
+        for _ in range(10):
+            time.sleep(3)
+            info_r = self.session.post(
+                f"{self.BASE_URL}/v1/report/info",
+                data=json.dumps({"code": code}), timeout=15,
             )
-            if not r.ok:
+            if not info_r.ok:
+                continue
+            info = info_r.json().get("result", {})
+            if info.get("status") == "success":
+                report_url = info.get("file")
                 break
-            data   = r.json()
-            orders = (data.get("supply_orders")
-                      or data.get("result", {}).get("supply_orders", []))
-            if not orders:
-                break
-            for order in orders:
-                status    = order.get("status", "")
-                if status in FINAL_STATUSES:
-                    continue
-                supply_id = str(order.get("supply_order_id", order.get("id", "")))
-                cluster   = (order.get("destination_place_name")
-                             or order.get("warehouse_name")
-                             or order.get("destination_warehouse", "—"))
-                for item in (order.get("items") or order.get("supply_order_items", [])):
-                    sku_id   = str(item.get("offer_id", item.get("sku", "")))
-                    sku_name = item.get("name", item.get("product_name", sku_id))
-                    qty      = int(item.get("quantity", item.get("quantity_accepted", 0)) or 0)
-                    price    = float(item.get("price", item.get("item_price", 0)) or 0)
-                    rows.append({
-                        "supply_id": supply_id,
-                        "status":    status,
-                        "cluster":   cluster,
-                        "sku_id":    sku_id,
-                        "sku_name":  sku_name,
-                        "quantity":  qty,
-                        "sum":       round(qty * price, 2),
-                    })
-            # Cursor для следующей страницы
-            last_id = (data.get("last_id")
-                       or data.get("result", {}).get("last_id", ""))
-            has_next = data.get("has_next", data.get("result", {}).get("has_next", False))
-            if not has_next or not last_id:
-                break
+
+        if not report_url:
+            return []
+
+        # Шаг 3: скачиваем CSV отчёт
+        csv_r = self.session.get(report_url, timeout=30)
+        if not csv_r.ok:
+            return []
+
+        import io
+        import csv as csv_mod
+        rows = []
+        reader = csv_mod.DictReader(io.StringIO(csv_r.text))
+        for row in reader:
+            status = row.get("Статус", row.get("status", ""))
+            if any(s in status.upper() for s in FINAL_STATUSES):
+                continue
+            rows.append({
+                "supply_id": row.get("ID поставки", row.get("Номер заявки", "")),
+                "status":    status,
+                "cluster":   row.get("Склад", row.get("Кластер", "—")),
+                "sku_id":    row.get("Артикул", row.get("offer_id", "")),
+                "sku_name":  row.get("Название товара", row.get("Товар", "")),
+                "quantity":  int(row.get("Количество", 0) or 0),
+                "sum":       float(row.get("Стоимость", 0) or 0),
+            })
         return rows
 
     def debug_supply(self) -> dict:
-        """Диагностика: показывает полный ответ для supply-order/list."""
-        results = {}
-        endpoints = [
-            ("/v2/supply-order/list",  {"limit": 5}),
-            ("/v1/supply-order/list",  {"limit": 5, "last_id": ""}),
-        ]
-        for path, payload in endpoints:
-            try:
-                r = self.session.post(
-                    f"{self.BASE_URL}{path}",
-                    data=json.dumps(payload), timeout=10,
-                )
-                try:
-                    body = r.json()
-                except Exception:
-                    body = r.text[:500]
-                results[path] = {
-                    "status":   r.status_code,
-                    "response": body,
-                }
-            except Exception as e:
-                results[path] = {"error": str(e)}
-        return results
+        """Диагностика: проверяет report/supply-orders/create."""
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        r = self.session.post(
+            f"{self.BASE_URL}/v1/report/supply-orders/create",
+            data=json.dumps({
+                "date_from": (now - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z"),
+                "date_to":    now.strftime("%Y-%m-%dT23:59:59Z"),
+                "language":  "DEFAULT",
+            }), timeout=15,
+        )
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text[:300]
+        return {"status": r.status_code, "response": body}
 
 
         """Диагностика: пробует v4 и v5, возвращает сырые ответы."""
