@@ -430,11 +430,20 @@ class OzonClient:
         return []  # используется get_supply_by_ids через UI
 
     def debug_supply(self) -> dict:
-        """Диагностика: v3/supply-order/list с правильными параметрами."""
+        """Диагностика: v3/supply-order/list с sort_by=1 и разными filter."""
         results = {}
-        # sort_by должен быть не 0 — пробуем разные значения
-        for sort_by in [1, 2, "SUPPLY_ORDER_SORT_BY_CREATED_AT", "SUPPLY_ORDER_SORT_BY_ID"]:
-            payload = {"limit": 5, "sort_by": sort_by}
+        now = datetime.now()
+        filters = [
+            {"created_at_from": (now - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z"),
+             "created_at_to":   now.strftime("%Y-%m-%dT23:59:59Z")},
+            {"date_from": (now - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z"),
+             "date_to":   now.strftime("%Y-%m-%dT23:59:59Z")},
+            {"statuses": [1, 2, 3, 4, 5]},
+            {"states": ["IN_TRANSIT", "CREATED", "APPROVED"]},
+            {},
+        ]
+        for f in filters:
+            payload = {"limit": 5, "sort_by": 1, "filter": f}
             r = self.session.post(
                 f"{self.BASE_URL}/v3/supply-order/list",
                 data=json.dumps(payload), timeout=10,
@@ -443,7 +452,7 @@ class OzonClient:
                 body = r.json()
             except Exception:
                 body = r.text[:300]
-            results[f"sort_by={sort_by}"] = {"status": r.status_code, "response": body}
+            results[f"filter={list(f.keys())}"] = {"status": r.status_code, "response": body}
             if r.ok:
                 break
         return results
