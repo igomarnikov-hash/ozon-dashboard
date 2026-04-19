@@ -386,48 +386,109 @@ class OzonClient:
             })
         return sorted(result, key=lambda x: x["clusters"], reverse=True)
 
-    def get_supply_by_ids(self, order_ids: list) -> list:
+    def get_supply_in_transit(self):
         """
-        POST /v2/supply-order/get — детали поставки по ID.
-        Возвращает строки: supply_id, status, cluster, sku_id, sku_name, quantity, sum
+        v3/supply-order/list → список order_ids по статусам в пути
+        v2/supply-order/get  → детали каждого заказа
         """
+        IN_TRANSIT_STATES = ["IN_TRANSIT", "ACCEPTED_AT_SUPPLY_WAREHOUSE",
+                             "DELIVERING_TO_DESTINATION_WAREHOUSE",
+                             "SUPPLY_VARIATIONS_CREATED", "CREATED", "APPROVED",
+                             "WAITING_FOR_SUPPLY", "SUPPLY_ON_THE_WAY"]
+
+        # Шаг 1: собираем все order_ids через курсорную пагинацию
+        all_order_ids = []
+        last_id = ""
+        while True:
+            payload = {
+                "limit": 100,
+                "sort_by": 1,
+                "filter": {"states": IN_TRANSIT_STATES},
+            }
+            if last_id:
+                payload["last_id"] = last_id
+            r = self.session.post(
+                f"{self.BASE_URL}/v3/supply-order/list",
+                data=json.dumps(payload), timeout=30,
+            )
+            if not r.ok:
+                break
+            data = r.json()
+            ids = data.get("order_ids", [])
+            all_order_ids.extend(ids)
+            last_id = data.get("last_id", "")
+            if not last_id or len(ids) < 100:
+                break
+
+        if not all_order_ids:
+            return []
+
+        # Шаг 2: получаем детали батчами через v2/supply-order/get
         rows = []
-        for oid in order_ids:
-            oid = str(oid).strip()
-            if not oid:
-                continue
+        for order_id in all_order_ids:
             r = self.session.post(
                 f"{self.BASE_URL}/v2/supply-order/get",
-                data=json.dumps({"supply_order_id": int(oid) if oid.isdigit() else oid}),
+                data=json.dumps({"supply_order_id": order_id}),
                 timeout=15,
             )
             if not r.ok:
                 continue
-            order = r.json().get("result", r.json())
-            if not order:
-                continue
-            supply_id = str(order.get("supply_order_id", order.get("id", oid)))
-            status    = order.get("status", "")
-            cluster   = (order.get("destination_place_name")
-                         or order.get("warehouse_name", "—"))
-            for item in (order.get("items") or order.get("supply_order_items", [])):
-                sku_id   = str(item.get("offer_id", item.get("sku", "")))
-                sku_name = item.get("name", item.get("product_name", sku_id))
-                qty      = int(item.get("quantity", 0) or 0)
-                price    = float(item.get("price", 0) or 0)
-                rows.append({
-                    "supply_id": supply_id,
-                    "status":    status,
-                    "cluster":   cluster,
-                    "sku_id":    sku_id,
-                    "sku_name":  sku_name,
-                    "quantity":  qty,
-                    "sum":       round(qty * price, 2),
-                })
+            data = r.json()
+            # Ответ может быть в result или напрямую
+            order = data.get("result", data)
+            # orders — массив или одиночный объект
+            orders = order if isinstance(order, list) else [order]
+            for o in orders:
+                supply_id = str(o.get("supply_order_id", o.get("id", order_id)))
+                status    = o.get("status", o.get("state", ""))
+                cluster   = (o.get("destination_place_name")
+                             or o.get("warehouse_name", "—"))
+                for item in (o.get("items") or o.get("supply_order_items", [])):
+                    sku_id   = str(item.get("offer_id", item.get("sku", "")))
+                    sku_name = item.get("name", item.get("product_name", sku_id))
+                    qty      = int(item.get("quantity", 0) or 0)
+                    price    = float(item.get("price", 0) or 0)
+                    rows.append({
+                        "supply_id": supply_id,
+                        "status":    status,
+                        "cluster":   cluster,
+                        "sku_id":    sku_id,
+                        "sku_name":  sku_name,
+                        "quantity":  qty,
+                        "sum":       round(qty * price, 2),
+                    })
         return rows
 
-    def get_supply_in_transit(self):
-        return []  # используется get_supply_by_ids через UI
+    def debug_supply(self) -> dict:
+        """Диагностика: показывает сырой ответ v2/supply-order/get для первого ID."""
+        # Сначала получаем первый order_id
+        r = self.session.post(
+            f"{self.BASE_URL}/v3/supply-order/list",
+            data=json.dumps({
+                "limit": 1, "sort_by": 1,
+                "filter": {"states": ["IN_TRANSIT", "CREATED", "APPROVED",
+                                      "SUPPLY_VARIATIONS_CREATED", "WAITING_FOR_SUPPLY"]},
+            }), timeout=10,
+        )
+        if not r.ok:
+            return {"list_status": r.status_code, "list_response": r.text[:200]}
+        ids = r.json().get("order_ids", [])
+        if not ids:
+            return {"list_status": 200, "order_ids": [], "note": "нет поставок в этих статусах"}
+        # Получаем детали первого
+        r2 = self.session.post(
+            f"{self.BASE_URL}/v2/supply-order/get",
+            data=json.dumps({"supply_order_id": ids[0]}), timeout=10,
+        )
+        try:
+            body2 = r2.json()
+        except Exception:
+            body2 = r2.text[:300]
+        return {
+            "first_order_id": ids[0],
+            "get_status":     r2.status_code,
+            "get_response":   body2,
+        }
 
     def debug_supply(self) -> dict:
         """Диагностика: v3/supply-order/list с sort_by=1 и разными filter."""
@@ -803,13 +864,11 @@ def load_real_localization(_cid, _key):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_real_supply_in_transit(_cid, _key, _order_ids_str):
-    """Загружает поставки по ID через /v2/supply-order/get."""
-    if not _order_ids_str.strip():
-        return []
-    ids = [x.strip() for x in _order_ids_str.replace("\n", ",").split(",") if x.strip()]
+def load_real_supply_in_transit(_cid, _key):
+    """Загружает поставки в пути через v3/supply-order/list + v2/supply-order/get."""
     client = OzonClient(client_id=_cid, api_key=_key)
-    return client.get_supply_by_ids(ids)
+    items = client.get_supply_in_transit()
+    return items if items else []
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -883,7 +942,7 @@ if "df" not in st.session_state or fetch_btn:
                     st.session_state.localization = MOCK_LOCALIZATION
                 try:
                     _sids = st.session_state.get("supply_order_ids", "")
-                    st.session_state.supply_in_transit = load_real_supply_in_transit(client_id, api_key, _sids)
+                    st.session_state.supply_in_transit = load_real_supply_in_transit(client_id, api_key)
                 except Exception:
                     st.session_state.supply_in_transit = []
                 st.session_state.data_error = None
