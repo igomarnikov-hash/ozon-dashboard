@@ -386,95 +386,83 @@ class OzonClient:
             })
         return sorted(result, key=lambda x: x["clusters"], reverse=True)
 
-    def get_supply_in_transit(self):
+    def get_supply_by_ids(self, order_ids: list) -> list:
         """
-        Получаем поставки через отчёт /v1/report/supply-orders/create,
-        затем читаем результат через /v1/report/info.
-        Параллельно пробуем /v2/supply-order/get по известным ID из отчёта.
+        POST /v2/supply-order/get — детали поставки по ID.
+        Возвращает строки: supply_id, status, cluster, sku_id, sku_name, quantity, sum
         """
-        import time
-
-        FINAL_STATUSES = {
-            "SUPPLY_ACCEPTED", "COMPLETED", "CANCELLED",
-            "REJECTED", "CLOSED", "DELIVERED",
-        }
-
-        # Шаг 1: запрос отчёта по поставкам
-        now = datetime.now()
-        r = self.session.post(
-            f"{self.BASE_URL}/v1/report/supply-orders/create",
-            data=json.dumps({
-                "date_from": (now - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z"),
-                "date_to":    now.strftime("%Y-%m-%dT23:59:59Z"),
-                "language":  "DEFAULT",
-            }), timeout=30,
-        )
-        if not r.ok:
-            return []
-
-        code = r.json().get("result", {}).get("code", "")
-        if not code:
-            return []
-
-        # Шаг 2: ждём готовности отчёта (до 30 сек)
-        report_url = None
-        for _ in range(10):
-            time.sleep(3)
-            info_r = self.session.post(
-                f"{self.BASE_URL}/v1/report/info",
-                data=json.dumps({"code": code}), timeout=15,
-            )
-            if not info_r.ok:
-                continue
-            info = info_r.json().get("result", {})
-            if info.get("status") == "success":
-                report_url = info.get("file")
-                break
-
-        if not report_url:
-            return []
-
-        # Шаг 3: скачиваем CSV отчёт
-        csv_r = self.session.get(report_url, timeout=30)
-        if not csv_r.ok:
-            return []
-
-        import io
-        import csv as csv_mod
         rows = []
-        reader = csv_mod.DictReader(io.StringIO(csv_r.text))
-        for row in reader:
-            status = row.get("Статус", row.get("status", ""))
-            if any(s in status.upper() for s in FINAL_STATUSES):
+        for oid in order_ids:
+            oid = str(oid).strip()
+            if not oid:
                 continue
-            rows.append({
-                "supply_id": row.get("ID поставки", row.get("Номер заявки", "")),
-                "status":    status,
-                "cluster":   row.get("Склад", row.get("Кластер", "—")),
-                "sku_id":    row.get("Артикул", row.get("offer_id", "")),
-                "sku_name":  row.get("Название товара", row.get("Товар", "")),
-                "quantity":  int(row.get("Количество", 0) or 0),
-                "sum":       float(row.get("Стоимость", 0) or 0),
-            })
+            r = self.session.post(
+                f"{self.BASE_URL}/v2/supply-order/get",
+                data=json.dumps({"supply_order_id": int(oid) if oid.isdigit() else oid}),
+                timeout=15,
+            )
+            if not r.ok:
+                continue
+            order = r.json().get("result", r.json())
+            if not order:
+                continue
+            supply_id = str(order.get("supply_order_id", order.get("id", oid)))
+            status    = order.get("status", "")
+            cluster   = (order.get("destination_place_name")
+                         or order.get("warehouse_name", "—"))
+            for item in (order.get("items") or order.get("supply_order_items", [])):
+                sku_id   = str(item.get("offer_id", item.get("sku", "")))
+                sku_name = item.get("name", item.get("product_name", sku_id))
+                qty      = int(item.get("quantity", 0) or 0)
+                price    = float(item.get("price", 0) or 0)
+                rows.append({
+                    "supply_id": supply_id,
+                    "status":    status,
+                    "cluster":   cluster,
+                    "sku_id":    sku_id,
+                    "sku_name":  sku_name,
+                    "quantity":  qty,
+                    "sum":       round(qty * price, 2),
+                })
         return rows
 
+    def get_supply_in_transit(self):
+        return []  # используется get_supply_by_ids через UI
+
     def debug_supply(self) -> dict:
-        """Диагностика: проверяет report/supply-orders/create."""
-        from datetime import datetime, timedelta
-        now = datetime.now()
-        r = self.session.post(
-            f"{self.BASE_URL}/v1/report/supply-orders/create",
-            data=json.dumps({
-                "date_from": (now - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z"),
-                "date_to":    now.strftime("%Y-%m-%dT23:59:59Z"),
-                "language":  "DEFAULT",
-            }), timeout=15,
+        """Диагностика: пробует v3/supply-order/list и v2/supply-order/get с фильтром."""
+        results = {}
+        # Тест 1: v3/supply-order/list с разными телами
+        for payload in [
+            {"limit": 5},
+            {"filter": {"statuses": ["SUPPLY_VARIATIONS_CREATED"]}, "limit": 5},
+            {"filter": {"status": "IN_TRANSIT"}, "limit": 5},
+            {"paging": {"from_supply_order_id": 0, "limit": 5}},
+        ]:
+            r = self.session.post(
+                f"{self.BASE_URL}/v3/supply-order/list",
+                data=json.dumps(payload), timeout=10,
+            )
+            key = f"v3/list {list(payload.keys())}"
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text[:200]
+            results[key] = {"status": r.status_code, "response": body}
+            if r.ok:
+                break  # нашли рабочий вариант
+
+        # Тест 2: v2/supply-order/get — проверим реальную структуру ответа
+        r2 = self.session.post(
+            f"{self.BASE_URL}/v2/supply-order/get",
+            data=json.dumps({"supply_order_id": 2000049302416}), timeout=10,
         )
         try:
-            body = r.json()
+            b2 = r2.json()
         except Exception:
-            body = r.text[:300]
-        return {"status": r.status_code, "response": body}
+            b2 = r2.text[:200]
+        results["v2/get with real ID"] = {"status": r2.status_code, "response": b2}
+        return results
 
 
         """Диагностика: пробует v4 и v5, возвращает сырые ответы."""
@@ -687,11 +675,9 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ozon_co
 
 def load_config() -> dict:
     """Загружает сохранённые ключи из файла конфига."""
-    cfg = {"client_id": "", "api_key": ""}
-    # 1. Проверяем переменные окружения (Railway / .env)
+    cfg = {"client_id": "", "api_key": "", "supply_order_ids": ""}
     cfg["client_id"] = os.environ.get("OZON_CLIENT_ID", "")
     cfg["api_key"]   = os.environ.get("OZON_API_KEY", "")
-    # 2. Если нет в env — читаем из локального файла
     if not cfg["client_id"] and os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE) as f:
@@ -703,14 +689,15 @@ def load_config() -> dict:
             pass
     return cfg
 
-def save_config(client_id: str, api_key: str):
+def save_config(client_id: str, api_key: str, supply_order_ids: str = ""):
     """Сохраняет ключи в локальный файл (только если не Railway)."""
     if os.environ.get("RAILWAY_ENVIRONMENT"):
-        return  # на Railway не пишем файл — там env vars
+        return
     try:
         with open(CONFIG_FILE, "w") as f:
             f.write(f"client_id={client_id}\n")
             f.write(f"api_key={api_key}\n")
+            f.write(f"supply_order_ids={supply_order_ids}\n")
     except Exception:
         pass
 
@@ -731,6 +718,8 @@ if "kpi_date_from" not in st.session_state:
     st.session_state.kpi_date_from = date.today() - timedelta(days=29)
 if "kpi_date_to" not in st.session_state:
     st.session_state.kpi_date_to = date.today()
+if "supply_order_ids" not in st.session_state:
+    st.session_state.supply_order_ids = _cfg.get("supply_order_ids", "")
 
 # ─────────────────────────────────────────────
 # DATA LOADING
@@ -820,12 +809,14 @@ def load_real_localization(_cid, _key):
     return items
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def load_real_supply_in_transit(_cid, _key):
-    """Загружает поставки FBO в пути."""
+@st.cache_data(ttl=300, show_spinner=False)
+def load_real_supply_in_transit(_cid, _key, _order_ids_str):
+    """Загружает поставки по ID через /v2/supply-order/get."""
+    if not _order_ids_str.strip():
+        return []
+    ids = [x.strip() for x in _order_ids_str.replace("\n", ",").split(",") if x.strip()]
     client = OzonClient(client_id=_cid, api_key=_key)
-    items = client.get_supply_in_transit()
-    return items if items else MOCK_SUPPLY_IN_TRANSIT
+    return client.get_supply_by_ids(ids)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -898,9 +889,10 @@ if "df" not in st.session_state or fetch_btn:
                 except Exception:
                     st.session_state.localization = MOCK_LOCALIZATION
                 try:
-                    st.session_state.supply_in_transit = load_real_supply_in_transit(client_id, api_key)
+                    _sids = st.session_state.get("supply_order_ids", "")
+                    st.session_state.supply_in_transit = load_real_supply_in_transit(client_id, api_key, _sids)
                 except Exception:
-                    st.session_state.supply_in_transit = MOCK_SUPPLY_IN_TRANSIT
+                    st.session_state.supply_in_transit = []
                 st.session_state.data_error = None
         except Exception as e:
             st.session_state.data_error   = str(e)
@@ -1035,6 +1027,14 @@ if st.session_state.get("show_settings", False):
         new_api_key   = st.text_input("Api-Key", value=st.session_state.api_key,
                                        placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
                                        type="password", key="inp_key")
+        st.markdown("**🚚 ID поставок в пути**")
+        st.caption("Номера через запятую: 2000049302416, 2000049302259, ...")
+        new_supply_ids = st.text_area(
+            "ID поставок",
+            value=st.session_state.supply_order_ids,
+            placeholder="2000049302416, 2000049302259",
+            height=80, key="inp_supply_ids", label_visibility="collapsed",
+        )
 
     with cfg2:
         st.markdown("**📅 Период — KPI карточки**")
@@ -1048,16 +1048,18 @@ if st.session_state.get("show_settings", False):
         st.markdown("**▶ Действия**")
         st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
         if st.button("💾 Сохранить и закрыть", use_container_width=True, key="btn_save"):
-            st.session_state.client_id     = new_client_id
-            st.session_state.api_key       = new_api_key
-            st.session_state.date_from     = new_date_from
-            st.session_state.date_to       = new_date_to
-            st.session_state.kpi_date_from = new_kpi_from
-            st.session_state.kpi_date_to   = new_kpi_to
-            st.session_state.show_settings = False
-            save_config(new_client_id, new_api_key)  # сохраняем на диск
+            st.session_state.client_id        = new_client_id
+            st.session_state.api_key          = new_api_key
+            st.session_state.date_from        = new_date_from
+            st.session_state.date_to          = new_date_to
+            st.session_state.kpi_date_from    = new_kpi_from
+            st.session_state.kpi_date_to      = new_kpi_to
+            st.session_state.supply_order_ids = new_supply_ids
+            st.session_state.show_settings    = False
+            save_config(new_client_id, new_api_key, new_supply_ids)
             for _k in ["df", "df_kpi", "df_sales", "balance", "balance_raw",
-                       "returns", "warehouse", "localization", "data_error"]:
+                       "returns", "warehouse", "localization",
+                       "supply_in_transit", "data_error"]:
                 st.session_state.pop(_k, None)
             load_real_data.clear()
             load_real_sales_data.clear()
@@ -1506,7 +1508,10 @@ else:
 # ─────────────────────────────────────────────
 st.markdown('<div class="section-title">🚚 Товары в пути</div>', unsafe_allow_html=True)
 
-_is_mock_supply = (not supply_in_transit) or (supply_in_transit and supply_in_transit[0].get("supply_id") in {s["supply_id"] for s in MOCK_SUPPLY_IN_TRANSIT})
+_is_mock_supply = (not supply_in_transit) or (
+    supply_in_transit and supply_in_transit[0].get("supply_id") in
+    {s["supply_id"] for s in MOCK_SUPPLY_IN_TRANSIT}
+)
 
 if not USE_MOCK and _is_mock_supply:
     with st.expander("🔍 Диагностика поставок", expanded=True):
