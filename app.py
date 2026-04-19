@@ -430,38 +430,22 @@ class OzonClient:
         return []  # используется get_supply_by_ids через UI
 
     def debug_supply(self) -> dict:
-        """Диагностика: пробует v3/supply-order/list и v2/supply-order/get с фильтром."""
+        """Диагностика: v3/supply-order/list с правильными параметрами."""
         results = {}
-        # Тест 1: v3/supply-order/list с разными телами
-        for payload in [
-            {"limit": 5},
-            {"filter": {"statuses": ["SUPPLY_VARIATIONS_CREATED"]}, "limit": 5},
-            {"filter": {"status": "IN_TRANSIT"}, "limit": 5},
-            {"paging": {"from_supply_order_id": 0, "limit": 5}},
-        ]:
+        # sort_by должен быть не 0 — пробуем разные значения
+        for sort_by in [1, 2, "SUPPLY_ORDER_SORT_BY_CREATED_AT", "SUPPLY_ORDER_SORT_BY_ID"]:
+            payload = {"limit": 5, "sort_by": sort_by}
             r = self.session.post(
                 f"{self.BASE_URL}/v3/supply-order/list",
                 data=json.dumps(payload), timeout=10,
             )
-            key = f"v3/list {list(payload.keys())}"
             try:
                 body = r.json()
             except Exception:
-                body = r.text[:200]
-            results[key] = {"status": r.status_code, "response": body}
+                body = r.text[:300]
+            results[f"sort_by={sort_by}"] = {"status": r.status_code, "response": body}
             if r.ok:
-                break  # нашли рабочий вариант
-
-        # Тест 2: v2/supply-order/get — проверим реальную структуру ответа
-        r2 = self.session.post(
-            f"{self.BASE_URL}/v2/supply-order/get",
-            data=json.dumps({"supply_order_id": 2000049302416}), timeout=10,
-        )
-        try:
-            b2 = r2.json()
-        except Exception:
-            b2 = r2.text[:200]
-        results["v2/get with real ID"] = {"status": r2.status_code, "response": b2}
+                break
         return results
 
 
