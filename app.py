@@ -1563,7 +1563,7 @@ if localization:
         return name[:28] + "…" if len(name) > 28 else name
     loc_df["short_name"] = loc_df["sku_name"].apply(shorten_name)
 
-    colors = ["#059669" if p >= 80 else ("#f59e0b" if p >= 50 else "#ef4444")
+    colors = ["#059669" if p >= 80 else ("#f59e0b" if p >= 40 else "#ef4444")
               for p in loc_df["pct"]]
 
     fig_loc = go.Figure()
