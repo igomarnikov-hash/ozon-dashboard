@@ -1520,20 +1520,26 @@ if localization:
     loc_df = pd.DataFrame(localization)
     loc_df["pct"]     = (loc_df["clusters"] / TOTAL_CLUSTERS * 100).round(1)
     loc_df["pct_fmt"] = loc_df["pct"].apply(lambda x: f"{x:.1f}%")
-    loc_df["bar"]     = loc_df["pct"].apply(lambda x:
-        "🟢" if x >= 80 else ("🟡" if x >= 50 else "🔴"))
+    # Сокращаем название: убираем "AromaTec Ароматизатор автомобильный," и берём первые 25 символов
+    def shorten_name(name):
+        for prefix in ["AromaTec Ароматизатор автомобильный, ",
+                       "AromaTec Ароматизатор ", "Ароматизатор "]:
+            name = name.replace(prefix, "")
+        return name[:28] + "…" if len(name) > 28 else name
+    loc_df["short_name"] = loc_df["sku_name"].apply(shorten_name)
 
-    # Plotly horizontal bar chart
+    colors = ["#059669" if p >= 80 else ("#f59e0b" if p >= 50 else "#ef4444")
+              for p in loc_df["pct"]]
+
     fig_loc = go.Figure()
-    colors  = ["#059669" if p >= 80 else ("#f59e0b" if p >= 50 else "#ef4444")
-               for p in loc_df["pct"]]
     fig_loc.add_trace(go.Bar(
-        y=loc_df["sku_name"],
+        y=loc_df["short_name"],
         x=loc_df["pct"],
         orientation="h",
         marker_color=colors,
         text=loc_df["pct_fmt"],
         textposition="outside",
+        textfont=dict(size=11, color="#1a2040"),
         hovertemplate="<b>%{y}</b><br>%{x:.1f}% (%{customdata} кластеров)<extra></extra>",
         customdata=loc_df["clusters"],
     ))
@@ -1541,13 +1547,24 @@ if localization:
     fig_loc.update_layout(
         **no_legend,
         height=max(300, len(loc_df) * 36),
-        xaxis=dict(range=[0, 110], ticksuffix="%", gridcolor="#eef0f8", zeroline=False,
-                   tickfont=dict(size=11, color="#8a98c0")),
-        yaxis=dict(tickfont=dict(size=11, color="#1a2040"), automargin=True),
+        xaxis=dict(
+            range=[0, 120],
+            ticksuffix="%",
+            gridcolor="#eef0f8",
+            zeroline=False,
+            tickfont=dict(size=11, color="#8a98c0"),
+            side="bottom",
+        ),
+        yaxis=dict(
+            tickfont=dict(size=11, color="#1a2040"),
+            automargin=True,
+            autorange="reversed",   # сверху вниз
+        ),
         shapes=[dict(type="line", x0=80, x1=80, y0=-0.5, y1=len(loc_df)-0.5,
                      line=dict(color="#005bff", width=1, dash="dot"))],
-        annotations=[dict(x=81, y=len(loc_df)-0.5, text="цель 80%",
+        annotations=[dict(x=80, y=-0.7, text="цель 80%", xanchor="center",
                           showarrow=False, font=dict(size=10, color="#005bff"))],
+        margin=dict(l=10, r=60, t=10, b=30),
     )
     st.markdown('<div class="chart-box">', unsafe_allow_html=True)
     st.plotly_chart(fig_loc, use_container_width=True, config={"displayModeBar": False})
