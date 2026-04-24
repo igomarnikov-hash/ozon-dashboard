@@ -966,7 +966,7 @@ balance: float       = st.session_state.get("balance", 0.0)
 returns: dict        = st.session_state.get("returns", MOCK_RETURNS)
 warehouse: dict      = st.session_state.get("warehouse", MOCK_WAREHOUSE)
 localization: list   = st.session_state.get("localization", MOCK_LOCALIZATION)
-supply_in_transit: list = st.session_state.get("supply_in_transit", MOCK_SUPPLY_IN_TRANSIT)
+supply_in_transit: list = st.session_state.get("supply_in_transit", [])
 
 for col in METRIC_KEYS:
     if col not in df.columns:
@@ -1583,12 +1583,7 @@ _is_mock_supply = (not supply_in_transit) or (
 )
 
 if not USE_MOCK and _is_mock_supply:
-    with st.expander("🔍 Диагностика поставок", expanded=True):
-        try:
-            _c = OzonClient(client_id=client_id, api_key=api_key)
-            st.json(_c.debug_supply())
-        except Exception as _e:
-            st.error(str(_e))
+    st.info("Загружаем поставки... Нажмите ⟳ Загрузить данные если данные не появились.")
 
 if supply_in_transit:
     sit_df = pd.DataFrame(supply_in_transit)
