@@ -366,8 +366,8 @@ class OzonClient:
 
     def get_localization(self):
         """
-        POST /v1/cluster/list — список кластеров.
-        POST /v2/analytics/stock_on_warehouses — считаем на скольких кластерах есть товар.
+        POST /v2/analytics/stock_on_warehouses — считаем локализацию по кластерам Ozon.
+        Склады маппируются на кластеры по префиксу города.
         """
         # Получаем все остатки по складам
         all_rows, offset = [], 0
@@ -388,29 +388,61 @@ class OzonClient:
         if not all_rows:
             return []
 
-        # Ozon не предоставляет публичный эндпоинт для списка кластеров.
-        # Считаем total_clusters динамически — сколько уникальных складов встретили.
-        total_clusters = 23  # официальное число кластеров Ozon на 2024-2025
+        # Официальные 23 кластера Ozon (2024-2025)
+        # Маппируем warehouse_name → cluster по префиксу
+        CLUSTER_PREFIXES = {
+            "МОСКВ": "Москва", "SOFYI": "Москва", "SOFINO": "Москва",
+            "ХОРУГ": "Москва", "ДОМОД": "Москва", "КОРО": "Москва",
+            "САНКТ": "Санкт-Петербург", "СПБ": "Санкт-Петербург",
+            "ЕКАТЕ": "Екатеринбург",
+            "НОВОС": "Новосибирск",
+            "КАЗАН": "Казань",
+            "НИЖНИ": "Нижний Новгород",
+            "САМАР": "Самара",
+            "РОСТОВ": "Ростов-на-Дону",
+            "КРАСНО": "Краснодар",
+            "КРАСНЯ": "Красноярск",
+            "ВОРО": "Воронеж",
+            "ПЕРМ": "Пермь",
+            "ВОЛГО": "Волгоград",
+            "САРАТОВ": "Саратов",
+            "ТЮМЕНЬ": "Тюмень", "ТЮМЕ": "Тюмень",
+            "УФА": "Уфа",
+            "ЯРОС": "Ярославль",
+            "ТВЕРЬ": "Тверь",
+            "ОМСК": "Омск",
+            "НЕВИН": "Невинномысск",
+            "КАЛИН": "Калининград",
+        }
 
-        # Считаем для каждого item_code на скольких разных складах есть остаток > 0
+        def wh_to_cluster(wh_name: str) -> str:
+            wh_up = wh_name.upper()
+            for prefix, cluster in CLUSTER_PREFIXES.items():
+                if wh_up.startswith(prefix):
+                    return cluster
+            # Берём первое слово до _ как кластер
+            return wh_name.split("_")[0].capitalize()
+
+        TOTAL_CLUSTERS = 23
+
         from collections import defaultdict
-        sku_warehouses: dict = defaultdict(set)
+        sku_clusters: dict = defaultdict(set)
         sku_names: dict = {}
         for row in all_rows:
             offer_id = str(row.get("item_code", ""))
             wh_name  = row.get("warehouse_name", "")
             units    = int(row.get("free_to_sell_amount", 0) or 0)
             if offer_id and wh_name and units > 0:
-                sku_warehouses[offer_id].add(wh_name)
+                sku_clusters[offer_id].add(wh_to_cluster(wh_name))
                 sku_names[offer_id] = row.get("item_name", offer_id)
 
         result = []
-        for offer_id, warehouses in sku_warehouses.items():
+        for offer_id, clusters in sku_clusters.items():
             result.append({
                 "sku_id":   offer_id,
                 "sku_name": sku_names.get(offer_id, offer_id),
-                "clusters": len(warehouses),
-                "_total":   total_clusters,
+                "clusters": len(clusters),
+                "_total":   TOTAL_CLUSTERS,
             })
         return sorted(result, key=lambda x: x["clusters"], reverse=True)
 
