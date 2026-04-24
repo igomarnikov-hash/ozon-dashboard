@@ -235,6 +235,16 @@ class OzonClient:
         }
 
     def get_returns(self, date_from: str, date_to: str, limit: int = 1000):
+        """POST /v3/returns/company/fbo + fbs — возвраты за период."""
+        payload = {
+            "filter": {
+                "date": {
+                    "from": f"{date_from}T00:00:00Z",
+                    "to":   f"{date_to}T23:59:59Z",
+                }
+            },
+            "limit": limit, "offset": 0,
+        }
         fbo_items, fbs_items = [], []
         r_fbo = self.session.post(f"{self.BASE_URL}/v3/returns/company/fbo",
                                    data=json.dumps(payload), timeout=30)
@@ -244,7 +254,7 @@ class OzonClient:
                                    data=json.dumps(payload), timeout=30)
         if r_fbs.ok:
             fbs_items = r_fbs.json().get("returns", [])
-        all_r = fbo_items + fbs_items
+        all_r     = fbo_items + fbs_items
         total_sum = sum(float(r.get("price", r.get("commissions_amount", 0)) or 0) for r in all_r)
         return {"count": len(all_r), "sum": total_sum}
 
@@ -1249,66 +1259,9 @@ if st.session_state.get("data_error"):
 if USE_MOCK:
     st.markdown('<div class="mock-badge">⚠ ДЕМО-РЕЖИМ — нажмите ⚙ Настройки и введите API-ключи</div>',
                 unsafe_allow_html=True)
-else:
-    with st.expander("🔍 Диагностика API (нажми чтобы проверить данные)", expanded=False):
-        st.markdown(f"**Период:** {date_from} — {date_to}")
-        st.markdown(f"**Строк в DataFrame:** {len(df)}")
-        st.markdown(f"**Колонки:** `{list(df.columns)}`")
-        st.markdown(f"**Баланс:** ₽{balance:,.0f}".replace(",", " "))
-        if len(df) > 0:
-            st.markdown("**Первые 3 строки сырых данных:**")
-            st.dataframe(df.head(3))
-        else:
-            st.warning("⚠️ DataFrame пустой — API вернул 0 строк. Возможные причины:\n"
-                       "- Нет продаж за выбранный период\n"
-                       "- Неверный Client-ID или Api-Key\n"
-                       "- Период слишком большой (попробуй последние 7 дней)")
-        # Показываем сырой ответ баланса
-        bal_raw = st.session_state.get("balance_raw", {})
-        endpoint = bal_raw.get("_endpoint_used", "неизвестен")
-        st.markdown(f"**Сырой ответ баланса (эндпоинт: `{endpoint}`):**")
-        try:
-            if bal_raw:
-                st.json(bal_raw)
-            else:
-                _client = OzonClient(client_id=client_id, api_key=api_key)
-                _raw = _client.get_finance_totals()
-                st.json(_raw)
-        except Exception as _e:
-            st.error(f"Ошибка запроса баланса: {_e}")
-        if st.session_state.get("data_error"):
-            st.error(f"Последняя ошибка API: {st.session_state.data_error}")
-        if not USE_MOCK:
-            st.markdown("**🏭 Сырой ответ /v2/analytics/stock_on_warehouses (первые 2):**")
-            try:
-                _c = OzonClient(client_id=client_id, api_key=api_key)
-                _r = _c.session.post(
-                    f"{_c.BASE_URL}/v2/analytics/stock_on_warehouses",
-                    data=json.dumps({"limit": 2, "offset": 0}), timeout=15)
-                st.write(f"Status: {_r.status_code}")
-                if _r.ok:
-                    st.json(_r.json())
-                else:
-                    st.error(_r.text[:300])
-            except Exception as _e:
-                st.error(f"Ошибка: {_e}")
-            st.markdown("**💰 Сырой ответ /v5/product/info/prices (первые 2):**")
-            try:
-                _c2 = OzonClient(client_id=client_id, api_key=api_key)
-                _rp = _c2.session.post(
-                    f"{_c2.BASE_URL}/v5/product/info/prices",
-                    data=json.dumps({"filter": {"visibility": "ALL"}, "limit": 2, "offset": 0}), timeout=15)
-                st.write(f"Status: {_rp.status_code}")
-                if _rp.ok:
-                    st.json(_rp.json())
-                else:
-                    st.error(_rp.text[:300])
-            except Exception as _e:
-                st.error(f"Ошибка цен: {_e}")
 
 # ─────────────────────────────────────────────
-# KPI DATE PICKER — inline прямо над карточками
-# ─────────────────────────────────────────────
+# KPI DATE PICKER
 kpi_date_from = st.session_state.kpi_date_from
 kpi_date_to   = st.session_state.kpi_date_to
 kpi_period    = f"{kpi_date_from.strftime('%d.%m')}–{kpi_date_to.strftime('%d.%m.%y')}"
@@ -1390,6 +1343,7 @@ if "df_kpi" not in st.session_state or "df_sales" not in st.session_state:
         if "localization" not in st.session_state or st.session_state.localization == MOCK_LOCALIZATION:
             try:
                 if not USE_MOCK:
+                    load_real_localization.clear()
                     st.session_state.localization = load_real_localization(client_id, api_key)
             except Exception:
                 pass
@@ -1696,12 +1650,7 @@ _is_mock_supply = (not supply_in_transit) or (
 )
 
 if not USE_MOCK and _is_mock_supply:
-    with st.expander("🔍 Диагностика поставок", expanded=True):
-        try:
-            _c = OzonClient(client_id=client_id, api_key=api_key)
-            st.json(_c.debug_supply())
-        except Exception as _e:
-            st.error(str(_e))
+    st.info("Нет поставок в пути или данные загружаются. Нажмите ⟳ Загрузить данные.")
 
 if supply_in_transit:
     sit_df = pd.DataFrame(supply_in_transit)
