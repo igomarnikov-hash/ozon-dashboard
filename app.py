@@ -516,7 +516,7 @@ class OzonClient:
         return rows
 
     def debug_supply(self) -> dict:
-        """Получаем первый order_id и пробуем разные эндпоинты для деталей."""
+        """Пробуем разные эндпоинты для деталей поставки."""
         r = self.session.post(
             f"{self.BASE_URL}/v3/supply-order/list",
             data=json.dumps({"limit": 1, "sort_by": 1,
@@ -532,26 +532,26 @@ class OzonClient:
         oid = ids[0]
         results = {"first_id": oid}
         for path, payload in [
-            ("/v2/supply-order/get",     {"supply_order_id": oid}),
-            ("/v1/supply-order/get",     {"supply_order_id": oid}),
-            ("/v2/supply-order/get",     {"id": oid}),
-            ("/v3/supply-order/get",     {"supply_order_id": oid}),
-            ("/v1/supply-order/items",   {"supply_order_id": oid, "limit": 10}),
-            ("/v2/supply-order/items",   {"supply_order_id": oid, "limit": 10}),
+            ("/v1/supply-order/list-by-ids", {"supply_order_ids": [oid]}),
+            ("/v2/supply-order/list-by-ids", {"supply_order_ids": [oid]}),
+            ("/v3/supply-order/list-by-ids", {"supply_order_ids": [oid]}),
+            ("/v1/supply-order/get-by-id",   {"supply_order_id": oid}),
+            ("/v2/supply-order/items",        {"supply_order_id": oid, "limit": 5}),
+            ("/v1/supply-order/items",        {"supply_order_id": oid, "limit": 5}),
+            ("/v3/supply-order/get",          {"supply_order_id": oid}),
         ]:
+            rr = self.session.post(f"{self.BASE_URL}{path}",
+                                   data=json.dumps(payload), timeout=8)
             try:
-                rr = self.session.post(f"{self.BASE_URL}{path}",
-                                       data=json.dumps(payload), timeout=8)
-                try:
-                    body = rr.json()
-                except Exception:
-                    body = rr.text[:200]
-                results[path] = {"status": rr.status_code, "keys": list(body.keys()) if isinstance(body, dict) else str(body)[:100]}
-                if rr.ok:
-                    results[path]["sample"] = body
-                    break
-            except Exception as e:
-                results[path] = {"error": str(e)}
+                body = rr.json()
+            except Exception:
+                body = rr.text[:100]
+            results[path] = {"status": rr.status_code}
+            if rr.ok:
+                results[path]["response"] = body
+                break
+            else:
+                results[path]["error"] = body if isinstance(body, str) else body.get("message", str(body))[:100]
         return results
 
     def debug_supply(self) -> dict:
