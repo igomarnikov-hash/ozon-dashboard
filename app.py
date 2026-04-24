@@ -201,12 +201,40 @@ class OzonClient:
             return data
         raise RuntimeError("Все финансовые эндпоинты вернули ошибку")
 
-    def get_returns(self, date_from: str, date_to: str, limit: int = 1000):
-        """POST /v3/returns/company/fbo + fbs — возвраты (сумма и кол-во)"""
+    def get_finance_revenue(self, date_from: str, date_to: str) -> dict:
+        """
+        POST /v3/finance/transaction/totals — продажи за период.
+        Продажи = accruals_for_sale + partner_programs (как в ЛК Ozon Финансы).
+        """
         payload = {
-            "filter": {"date": {"from": f"{date_from}T00:00:00Z", "to": f"{date_to}T23:59:59Z"}},
-            "limit": limit, "offset": 0,
+            "date": {
+                "from": f"{date_from}T00:00:00.000Z",
+                "to":   f"{date_to}T23:59:59.000Z",
+            },
+            "transaction_type": "all",
         }
+        r = self.session.post(
+            f"{self.BASE_URL}/v3/finance/transaction/totals",
+            data=json.dumps(payload), timeout=15,
+        )
+        if not r.ok:
+            return {}
+        data   = r.json()
+        totals = data.get("result", data)
+        accruals = float(totals.get("accruals_for_sale", 0) or 0)
+        partner  = float(totals.get("partner_programs", 0) or 0)
+        points   = float(totals.get("discount_points", totals.get("bonus_points", 0)) or 0)
+        # Итого продажи = accruals + partner + баллы (как показывает ЛК)
+        total_sales = accruals + partner + points
+        return {
+            "total_sales":      total_sales,
+            "accruals_for_sale": accruals,
+            "partner_programs":  partner,
+            "discount_points":   points,
+            "raw":               totals,
+        }
+
+    def get_returns(self, date_from: str, date_to: str, limit: int = 1000):
         fbo_items, fbs_items = [], []
         r_fbo = self.session.post(f"{self.BASE_URL}/v3/returns/company/fbo",
                                    data=json.dumps(payload), timeout=30)
@@ -488,35 +516,43 @@ class OzonClient:
         return rows
 
     def debug_supply(self) -> dict:
-        """Диагностика: показывает сырой ответ v2/supply-order/get для первого ID."""
-        # Сначала получаем первый order_id
+        """Получаем первый order_id и пробуем разные эндпоинты для деталей."""
         r = self.session.post(
             f"{self.BASE_URL}/v3/supply-order/list",
-            data=json.dumps({
-                "limit": 1, "sort_by": 1,
-                "filter": {"states": ["IN_TRANSIT", "CREATED", "APPROVED",
-                                      "SUPPLY_VARIATIONS_CREATED", "WAITING_FOR_SUPPLY"]},
-            }), timeout=10,
+            data=json.dumps({"limit": 1, "sort_by": 1,
+                             "filter": {"states": ["IN_TRANSIT", "CREATED", "APPROVED",
+                                                   "SUPPLY_VARIATIONS_CREATED"]}}),
+            timeout=10,
         )
         if not r.ok:
-            return {"list_status": r.status_code, "list_response": r.text[:200]}
+            return {"error": r.text[:200]}
         ids = r.json().get("order_ids", [])
         if not ids:
-            return {"list_status": 200, "order_ids": [], "note": "нет поставок в этих статусах"}
-        # Получаем детали первого
-        r2 = self.session.post(
-            f"{self.BASE_URL}/v2/supply-order/get",
-            data=json.dumps({"supply_order_id": ids[0]}), timeout=10,
-        )
-        try:
-            body2 = r2.json()
-        except Exception:
-            body2 = r2.text[:300]
-        return {
-            "first_order_id": ids[0],
-            "get_status":     r2.status_code,
-            "get_response":   body2,
-        }
+            return {"no_ids": True}
+        oid = ids[0]
+        results = {"first_id": oid}
+        for path, payload in [
+            ("/v2/supply-order/get",     {"supply_order_id": oid}),
+            ("/v1/supply-order/get",     {"supply_order_id": oid}),
+            ("/v2/supply-order/get",     {"id": oid}),
+            ("/v3/supply-order/get",     {"supply_order_id": oid}),
+            ("/v1/supply-order/items",   {"supply_order_id": oid, "limit": 10}),
+            ("/v2/supply-order/items",   {"supply_order_id": oid, "limit": 10}),
+        ]:
+            try:
+                rr = self.session.post(f"{self.BASE_URL}{path}",
+                                       data=json.dumps(payload), timeout=8)
+                try:
+                    body = rr.json()
+                except Exception:
+                    body = rr.text[:200]
+                results[path] = {"status": rr.status_code, "keys": list(body.keys()) if isinstance(body, dict) else str(body)[:100]}
+                if rr.ok:
+                    results[path]["sample"] = body
+                    break
+            except Exception as e:
+                results[path] = {"error": str(e)}
+        return results
 
     def debug_supply(self) -> dict:
         """Диагностика: v3/supply-order/list с sort_by=1 и разными filter."""
@@ -837,6 +873,12 @@ def load_real_sales_data(_cid, _key, df_str, dt_str):
     return parse_analytics_response(resp)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def load_real_finance_revenue(_cid, _key, df_str, dt_str):
+    client = OzonClient(client_id=_cid, api_key=_key)
+    return client.get_finance_revenue(df_str, dt_str)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_real_balance(_cid, _key):
     client = OzonClient(client_id=_cid, api_key=_key)
@@ -1139,7 +1181,7 @@ if st.session_state.get("show_settings", False):
             save_config(new_client_id, new_api_key, new_supply_ids)
             for _k in ["df", "df_kpi", "df_sales", "balance", "balance_raw",
                        "returns", "warehouse", "localization",
-                       "supply_in_transit", "data_error"]:
+                       "supply_in_transit", "finance_revenue", "data_error"]:
                 st.session_state.pop(_k, None)
             load_real_data.clear()
             load_real_sales_data.clear()
@@ -1294,6 +1336,14 @@ if "df_kpi" not in st.session_state or "df_sales" not in st.session_state:
                     st.session_state.df_sales = sales_df
             except Exception:
                 st.session_state.df_sales = pd.DataFrame()
+        if "finance_revenue" not in st.session_state:
+            try:
+                st.session_state.finance_revenue = (
+                    load_real_finance_revenue(client_id, api_key, kdf_str, kdt_str)
+                    if not USE_MOCK else {}
+                )
+            except Exception:
+                st.session_state.finance_revenue = {}
         try:
             if not USE_MOCK and "returns" not in st.session_state:
                 st.session_state.returns = load_real_returns(client_id, api_key, kdf_str, kdt_str)
@@ -1314,6 +1364,7 @@ if "df_kpi" not in st.session_state or "df_sales" not in st.session_state:
 
 df_kpi   = st.session_state.get("df_kpi", df)
 df_sales = st.session_state.get("df_sales", pd.DataFrame())
+finance_revenue = st.session_state.get("finance_revenue", {})
 returns  = st.session_state.get("returns", MOCK_RETURNS)
 warehouse    = st.session_state.get("warehouse", MOCK_WAREHOUSE)
 localization = st.session_state.get("localization", MOCK_LOCALIZATION)
@@ -1328,17 +1379,12 @@ total_revenue = float(df_kpi["revenue"].sum())
 total_orders  = int(df_kpi["ordered_units"].sum())
 total_views   = int(df_kpi["hits_view"].sum())
 
-# delivered_units из df_sales (dimension=day, без sku) — реально выкупленные
-if not df_sales.empty and "delivered_units" in df_sales.columns:
-    total_delivered   = int(df_sales["delivered_units"].sum())
-    revenue_delivered = float(df_sales["revenue"].sum()) if "revenue" in df_sales.columns else 0.0
-else:
-    total_delivered   = 0
-    revenue_delivered = 0.0
+# Выручка из финансов (Финансы → Продажи и возвраты → Выручка)
+fin_revenue = float(finance_revenue.get("total_sales", 0) or 0)
+fin_partner = float(finance_revenue.get("partner_programs", 0) or 0)
 
-cvr           = (total_orders / total_views * 100) if total_views else 0
-avg_order     = total_revenue / total_orders if total_orders else 0
-avg_delivered = revenue_delivered / total_delivered if total_delivered else 0
+cvr       = (total_orders / total_views * 100) if total_views else 0
+avg_order = total_revenue / total_orders if total_orders else 0
 
 c1, c2, c3, c4 = st.columns(4)
 
@@ -1378,15 +1424,15 @@ dual_card(
     delta=f"Ср. чек ₽{avg_order:,.0f}".replace(",", " "),
 )
 
-# Карточка 2 — ПРОДАЖИ: выкупленные (delivered_units + revenue_delivered)
-if total_delivered > 0:
+# Карточка 2 — ПРОДАЖИ: выручка из финансов
+if fin_revenue > 0:
     dual_card(
         c2, "card-sales", "💰", "ПРОДАЖИ",
-        main_val=f"₽{revenue_delivered:,.0f}".replace(",", " "),
+        main_val=f"₽{fin_revenue:,.0f}".replace(",", " "),
         sep="/",
-        sub_val=f"{total_delivered:,} выкуп.".replace(",", " "),
-        delta=f"▲ Конверсия {cvr:.1f}%" if cvr > 0 else f"Ср. чек ₽{avg_delivered:,.0f}".replace(",", " "),
-        delta_cls="delta-pos" if cvr > 2 else "delta-neu",
+        sub_val=f"партнёры ₽{fin_partner:,.0f}".replace(",", " ") if fin_partner else f"конв. {cvr:.1f}%",
+        delta=f"Выручка за период",
+        delta_cls="delta-pos",
     )
 else:
     dual_card(
@@ -1394,7 +1440,7 @@ else:
         main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
         sep="/",
         sub_val=f"{total_orders:,} шт".replace(",", " "),
-        delta="Данные о выкупе загружаются…",
+        delta="Финансовые данные загружаются…",
         delta_cls="delta-neu",
     )
 
@@ -1618,7 +1664,12 @@ _is_mock_supply = (not supply_in_transit) or (
 )
 
 if not USE_MOCK and _is_mock_supply:
-    st.info("Загружаем поставки... Нажмите ⟳ Загрузить данные если данные не появились.")
+    with st.expander("🔍 Диагностика поставок", expanded=True):
+        try:
+            _c = OzonClient(client_id=client_id, api_key=api_key)
+            st.json(_c.debug_supply())
+        except Exception as _e:
+            st.error(str(_e))
 
 if supply_in_transit:
     sit_df = pd.DataFrame(supply_in_transit)
