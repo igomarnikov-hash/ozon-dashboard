@@ -388,15 +388,15 @@ class OzonClient:
 
     def get_supply_in_transit(self):
         """
-        v3/supply-order/list → список order_ids по статусам в пути
-        v2/supply-order/get  → детали каждого заказа
+        v3/supply-order/list → order_ids
+        v1/supply-order/get  → детали (v2 возвращает 404)
         """
         IN_TRANSIT_STATES = ["IN_TRANSIT", "ACCEPTED_AT_SUPPLY_WAREHOUSE",
                              "DELIVERING_TO_DESTINATION_WAREHOUSE",
                              "SUPPLY_VARIATIONS_CREATED", "CREATED", "APPROVED",
                              "WAITING_FOR_SUPPLY", "SUPPLY_ON_THE_WAY"]
 
-        # Шаг 1: собираем все order_ids через курсорную пагинацию
+        # Шаг 1: получаем order_ids
         all_order_ids = []
         last_id = ""
         while True:
@@ -423,24 +423,52 @@ class OzonClient:
         if not all_order_ids:
             return []
 
-        # Шаг 2: получаем детали батчами через v2/supply-order/get
+        # Шаг 2: детали — пробуем разные эндпоинты
         rows = []
+        # Определяем рабочий эндпоинт по первому ID
+        working_endpoint = None
+        first_id = all_order_ids[0]
+        for endpoint, key_name in [
+            ("/v1/supply-order/get", "supply_order_id"),
+            ("/v2/supply-order/get", "supply_order_id"),
+            ("/v1/supply-order/get", "id"),
+        ]:
+            test_r = self.session.post(
+                f"{self.BASE_URL}{endpoint}",
+                data=json.dumps({key_name: first_id}), timeout=10,
+            )
+            if test_r.ok:
+                working_endpoint = (endpoint, key_name)
+                break
+
+        if not working_endpoint:
+            # Если ни один не работает — возвращаем хотя бы ID и кластер из v3
+            for oid in all_order_ids:
+                rows.append({
+                    "supply_id": str(oid),
+                    "status":    "В пути",
+                    "cluster":   "—",
+                    "sku_id":    "—",
+                    "sku_name":  "Детали недоступны",
+                    "quantity":  0,
+                    "sum":       0.0,
+                })
+            return rows
+
+        endpoint, key_name = working_endpoint
         for order_id in all_order_ids:
             r = self.session.post(
-                f"{self.BASE_URL}/v2/supply-order/get",
-                data=json.dumps({"supply_order_id": order_id}),
-                timeout=15,
+                f"{self.BASE_URL}{endpoint}",
+                data=json.dumps({key_name: order_id}), timeout=15,
             )
             if not r.ok:
                 continue
-            data = r.json()
-            # Ответ может быть в result или напрямую
+            data  = r.json()
             order = data.get("result", data)
-            # orders — массив или одиночный объект
             orders = order if isinstance(order, list) else [order]
             for o in orders:
                 supply_id = str(o.get("supply_order_id", o.get("id", order_id)))
-                status    = o.get("status", o.get("state", ""))
+                status    = o.get("status", o.get("state", "В пути"))
                 cluster   = (o.get("destination_place_name")
                              or o.get("warehouse_name", "—"))
                 for item in (o.get("items") or o.get("supply_order_items", [])):
@@ -1254,9 +1282,16 @@ if "df_kpi" not in st.session_state or "df_sales" not in st.session_state:
         if "df_sales" not in st.session_state:
             try:
                 if USE_MOCK:
-                    st.session_state.df_sales = pd.DataFrame()  # mock не имеет delivered_units
+                    st.session_state.df_sales = pd.DataFrame()
                 else:
-                    st.session_state.df_sales = load_real_sales_data(client_id, api_key, kdf_str, kdt_str)
+                    # delivered_units появляется с задержкой ~3 дня
+                    lag_dt = (kpi_date_to - timedelta(days=3)).strftime("%Y-%m-%d")
+                    lag_df = (kpi_date_from - timedelta(days=3)).strftime("%Y-%m-%d")
+                    sales_df = load_real_sales_data(client_id, api_key, lag_df, lag_dt)
+                    # Если delivered_units всё равно 0 — пробуем без лага
+                    if sales_df.empty or ("delivered_units" not in sales_df.columns) or (sales_df["delivered_units"].sum() == 0):
+                        sales_df = load_real_sales_data(client_id, api_key, kdf_str, kdt_str)
+                    st.session_state.df_sales = sales_df
             except Exception:
                 st.session_state.df_sales = pd.DataFrame()
         try:
