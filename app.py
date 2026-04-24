@@ -1543,7 +1543,7 @@ if localization:
         hovertemplate="<b>%{y}</b><br>%{x:.1f}% (%{customdata} кластеров)<extra></extra>",
         customdata=loc_df["clusters"],
     ))
-    no_legend = {k: v for k, v in THEME.items() if k not in ("legend", "xaxis", "yaxis")}
+    no_legend = {k: v for k, v in THEME.items() if k not in ("legend", "xaxis", "yaxis", "margin")}
     fig_loc.update_layout(
         **no_legend,
         height=max(300, len(loc_df) * 36),
@@ -1558,7 +1558,7 @@ if localization:
         yaxis=dict(
             tickfont=dict(size=11, color="#1a2040"),
             automargin=True,
-            autorange="reversed",   # сверху вниз
+            autorange="reversed",
         ),
         shapes=[dict(type="line", x0=80, x1=80, y0=-0.5, y1=len(loc_df)-0.5,
                      line=dict(color="#005bff", width=1, dash="dot"))],
