@@ -202,10 +202,8 @@ class OzonClient:
         raise RuntimeError("Все финансовые эндпоинты вернули ошибку")
 
     def get_finance_revenue(self, date_from: str, date_to: str) -> dict:
-        """
-        POST /v3/finance/transaction/totals — продажи за период.
-        Продажи = accruals_for_sale + partner_programs (как в ЛК Ozon Финансы).
-        """
+        """Продажи из финансов за период."""
+        # Вариант 1: /v3/finance/transaction/totals
         payload = {
             "date": {
                 "from": f"{date_from}T00:00:00.000Z",
@@ -217,22 +215,54 @@ class OzonClient:
             f"{self.BASE_URL}/v3/finance/transaction/totals",
             data=json.dumps(payload), timeout=15,
         )
-        if not r.ok:
-            return {}
-        data   = r.json()
-        totals = data.get("result", data)
-        accruals = float(totals.get("accruals_for_sale", 0) or 0)
-        partner  = float(totals.get("partner_programs", 0) or 0)
-        points   = float(totals.get("discount_points", totals.get("bonus_points", 0)) or 0)
-        # Итого продажи = accruals + partner + баллы (как показывает ЛК)
-        total_sales = accruals + partner + points
-        return {
-            "total_sales":      total_sales,
-            "accruals_for_sale": accruals,
-            "partner_programs":  partner,
-            "discount_points":   points,
-            "raw":               totals,
-        }
+        if r.ok:
+            data   = r.json()
+            totals = data.get("result", data)
+            # Перебираем все возможные поля выручки
+            accruals = float(
+                totals.get("accruals_for_sale") or
+                totals.get("sale_commission") or
+                totals.get("delivery_charge") or 0
+            )
+            partner = float(totals.get("partner_programs") or 0)
+            points  = float(
+                totals.get("discount_points") or
+                totals.get("bonus_points") or 0
+            )
+            total_sales = accruals + partner + points
+            if total_sales > 0:
+                return {
+                    "total_sales":       total_sales,
+                    "accruals_for_sale": accruals,
+                    "partner_programs":  partner,
+                    "discount_points":   points,
+                    "raw":               totals,
+                }
+
+        # Вариант 2: /v2/finance/transaction/list — суммируем все начисления
+        r2 = self.session.post(
+            f"{self.BASE_URL}/v3/finance/transaction/list",
+            data=json.dumps({
+                "filter": {
+                    "date": {
+                        "from": f"{date_from}T00:00:00.000Z",
+                        "to":   f"{date_to}T23:59:59.000Z",
+                    },
+                    "transaction_type": "accruals",
+                },
+                "page": 1, "page_size": 1000,
+            }), timeout=15,
+        )
+        if r2.ok:
+            data2  = r2.json()
+            result = data2.get("result", {})
+            total  = float(result.get("accruals_for_sale", 0) or
+                           result.get("total_sum", 0) or 0)
+            if total > 0:
+                return {"total_sales": total, "accruals_for_sale": total,
+                        "partner_programs": 0, "discount_points": 0, "raw": result}
+
+        return {}
 
     def get_returns(self, date_from: str, date_to: str, limit: int = 1000):
         """POST /v3/returns/company/fbo + fbs — возвраты за период."""
@@ -964,20 +994,17 @@ def load_real_warehouse(_cid, _key):
             "items": result_items[:50]}
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_real_localization(_cid, _key):
     """Загружает уровень локализации — считается из stock_on_warehouses."""
     client = OzonClient(client_id=_cid, api_key=_key)
     items = client.get_localization()
-    if not items:
-        return MOCK_LOCALIZATION
-    # get_localization уже возвращает {sku_id, sku_name, clusters}
-    return items
+    return items if items else []
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_real_supply_in_transit(_cid, _key):
-    """Загружает поставки в пути через v3/supply-order/list + v2/supply-order/get."""
+    """Загружает поставки в пути через v3/supply-order/list."""
     client = OzonClient(client_id=_cid, api_key=_key)
     items = client.get_supply_in_transit()
     return items if items else []
@@ -1417,16 +1444,18 @@ if fin_revenue > 0:
         main_val=f"₽{fin_revenue:,.0f}".replace(",", " "),
         sep="/",
         sub_val=f"партнёры ₽{fin_partner:,.0f}".replace(",", " ") if fin_partner else f"конв. {cvr:.1f}%",
-        delta=f"Выручка за период",
+        delta="Финансы · продажи и возвраты",
         delta_cls="delta-pos",
     )
 else:
+    # Показываем сырые ключи для отладки
+    _raw_keys = list(finance_revenue.get("raw", {}).keys()) if finance_revenue else []
     dual_card(
         c2, "card-sales", "💰", "ПРОДАЖИ",
         main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
         sep="/",
         sub_val=f"{total_orders:,} шт".replace(",", " "),
-        delta="Финансовые данные загружаются…",
+        delta=f"Фин. данные: {_raw_keys[:3]}" if _raw_keys else "Загрузите данные",
         delta_cls="delta-neu",
     )
 
@@ -1644,10 +1673,7 @@ else:
 # ─────────────────────────────────────────────
 st.markdown('<div class="section-title">🚚 Товары в пути</div>', unsafe_allow_html=True)
 
-_is_mock_supply = (not supply_in_transit) or (
-    supply_in_transit and supply_in_transit[0].get("supply_id") in
-    {s["supply_id"] for s in MOCK_SUPPLY_IN_TRANSIT}
-)
+_is_mock_supply = not supply_in_transit
 
 if not USE_MOCK and _is_mock_supply:
     st.info("Нет поставок в пути или данные загружаются. Нажмите ⟳ Загрузить данные.")
