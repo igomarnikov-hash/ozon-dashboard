@@ -523,68 +523,99 @@ class OzonClient:
         if not all_order_ids:
             return []
 
-        # Шаг 2: детали — пробуем разные эндпоинты
+        # Шаг 2: пробуем получить детали разными способами
         rows = []
-        # Определяем рабочий эндпоинт по первому ID
-        working_endpoint = None
-        first_id = all_order_ids[0]
-        for endpoint, key_name in [
-            ("/v1/supply-order/get", "supply_order_id"),
-            ("/v2/supply-order/get", "supply_order_id"),
-            ("/v1/supply-order/get", "id"),
-        ]:
-            test_r = self.session.post(
-                f"{self.BASE_URL}{endpoint}",
-                data=json.dumps({key_name: first_id}), timeout=10,
-            )
-            if test_r.ok:
-                working_endpoint = (endpoint, key_name)
-                break
 
-        if not working_endpoint:
-            # Если ни один не работает — возвращаем хотя бы ID и кластер из v3
+        # Попытка А: v3/supply-order/list с фильтром по конкретным IDs
+        chunk_size = 10
+        for i in range(0, min(len(all_order_ids), 100), chunk_size):
+            chunk = all_order_ids[i:i+chunk_size]
+            r = self.session.post(
+                f"{self.BASE_URL}/v3/supply-order/list",
+                data=json.dumps({
+                    "limit": chunk_size,
+                    "sort_by": 1,
+                    "filter": {
+                        "states": IN_TRANSIT_STATES,
+                        "supply_order_ids": chunk,
+                    },
+                }), timeout=15,
+            )
+            if r.ok:
+                data = r.json()
+                # Если вернул orders с деталями — берём их
+                orders = data.get("orders", data.get("supply_orders", []))
+                for o in orders:
+                    supply_id = str(o.get("supply_order_id", o.get("id", "")))
+                    cluster   = o.get("destination_place_name", o.get("warehouse_name", "—"))
+                    status    = o.get("status", "В пути")
+                    for item in (o.get("items") or o.get("supply_order_items", [])):
+                        rows.append({
+                            "supply_id": supply_id, "status": status, "cluster": cluster,
+                            "sku_id":   str(item.get("offer_id", item.get("sku", ""))),
+                            "sku_name": item.get("name", item.get("product_name", "")),
+                            "quantity": int(item.get("quantity", 0) or 0),
+                            "sum":      round(float(item.get("price", 0) or 0) *
+                                             int(item.get("quantity", 0) or 0), 2),
+                        })
+
+        # Попытка Б: если детали не получили — пробуем get по одному
+        if not rows:
+            working_endpoint = None
+            first_id = all_order_ids[0]
+            for endpoint, key_name in [
+                ("/v1/supply-order/get", "supply_order_id"),
+                ("/v2/supply-order/get", "supply_order_id"),
+                ("/v3/supply-order/get", "supply_order_id"),
+                ("/v1/supply-order/list-by-ids", "supply_order_ids"),
+            ]:
+                payload = ({key_name: [first_id]} if "ids" in key_name
+                           else {key_name: first_id})
+                test_r = self.session.post(
+                    f"{self.BASE_URL}{endpoint}",
+                    data=json.dumps(payload), timeout=10,
+                )
+                if test_r.ok:
+                    working_endpoint = (endpoint, key_name)
+                    break
+
+            if working_endpoint:
+                endpoint, key_name = working_endpoint
+                for order_id in all_order_ids:
+                    payload = ({key_name: [order_id]} if "ids" in key_name
+                               else {key_name: order_id})
+                    r = self.session.post(
+                        f"{self.BASE_URL}{endpoint}",
+                        data=json.dumps(payload), timeout=15,
+                    )
+                    if not r.ok:
+                        continue
+                    data  = r.json()
+                    order = data.get("result", data)
+                    orders = order if isinstance(order, list) else [order]
+                    for o in orders:
+                        supply_id = str(o.get("supply_order_id", o.get("id", order_id)))
+                        cluster   = o.get("destination_place_name", o.get("warehouse_name", "—"))
+                        status    = o.get("status", "В пути")
+                        for item in (o.get("items") or o.get("supply_order_items", [])):
+                            rows.append({
+                                "supply_id": supply_id, "status": status, "cluster": cluster,
+                                "sku_id":   str(item.get("offer_id", item.get("sku", ""))),
+                                "sku_name": item.get("name", ""),
+                                "quantity": int(item.get("quantity", 0) or 0),
+                                "sum":      round(float(item.get("price", 0) or 0) *
+                                                 int(item.get("quantity", 0) or 0), 2),
+                            })
+
+        # Попытка В: совсем нет деталей — показываем хотя бы список поставок
+        if not rows:
             for oid in all_order_ids:
                 rows.append({
-                    "supply_id": str(oid),
-                    "status":    "В пути",
-                    "cluster":   "—",
-                    "sku_id":    "—",
-                    "sku_name":  "Детали недоступны",
-                    "quantity":  0,
-                    "sum":       0.0,
+                    "supply_id": str(oid), "status": "В пути",
+                    "cluster": "—", "sku_id": "—",
+                    "sku_name": "Детали недоступны (нет доступа к API деталей)",
+                    "quantity": 0, "sum": 0.0,
                 })
-            return rows
-
-        endpoint, key_name = working_endpoint
-        for order_id in all_order_ids:
-            r = self.session.post(
-                f"{self.BASE_URL}{endpoint}",
-                data=json.dumps({key_name: order_id}), timeout=15,
-            )
-            if not r.ok:
-                continue
-            data  = r.json()
-            order = data.get("result", data)
-            orders = order if isinstance(order, list) else [order]
-            for o in orders:
-                supply_id = str(o.get("supply_order_id", o.get("id", order_id)))
-                status    = o.get("status", o.get("state", "В пути"))
-                cluster   = (o.get("destination_place_name")
-                             or o.get("warehouse_name", "—"))
-                for item in (o.get("items") or o.get("supply_order_items", [])):
-                    sku_id   = str(item.get("offer_id", item.get("sku", "")))
-                    sku_name = item.get("name", item.get("product_name", sku_id))
-                    qty      = int(item.get("quantity", 0) or 0)
-                    price    = float(item.get("price", 0) or 0)
-                    rows.append({
-                        "supply_id": supply_id,
-                        "status":    status,
-                        "cluster":   cluster,
-                        "sku_id":    sku_id,
-                        "sku_name":  sku_name,
-                        "quantity":  qty,
-                        "sum":       round(qty * price, 2),
-                    })
         return rows
 
     def debug_supply(self) -> dict:
@@ -1310,11 +1341,12 @@ with dp_col3:
     if st.button("✓ Применить", key="kpi_apply", use_container_width=True):
         st.session_state.kpi_date_from = new_kpi_from
         st.session_state.kpi_date_to   = new_kpi_to
-        for _k in ["df_kpi", "df_sales", "returns"]:
+        for _k in ["df_kpi", "df_sales", "returns", "finance_revenue"]:
             st.session_state.pop(_k, None)
         load_real_data.clear()
         load_real_sales_data.clear()
         load_real_returns.clear()
+        load_real_finance_revenue.clear()
         st.rerun()
 
 kpi_date_from = st.session_state.kpi_date_from
@@ -1356,10 +1388,14 @@ if "df_kpi" not in st.session_state or "df_sales" not in st.session_state:
                 st.session_state.df_sales = pd.DataFrame()
         if "finance_revenue" not in st.session_state:
             try:
-                st.session_state.finance_revenue = (
-                    load_real_finance_revenue(client_id, api_key, kdf_str, kdt_str)
-                    if not USE_MOCK else {}
-                )
+                _kdf = kpi_date_from.strftime("%Y-%m-%d")
+                _kdt = kpi_date_to.strftime("%Y-%m-%d")
+                if not USE_MOCK:
+                    load_real_finance_revenue.clear()
+                    st.session_state.finance_revenue = load_real_finance_revenue(
+                        client_id, api_key, _kdf, _kdt)
+                else:
+                    st.session_state.finance_revenue = {}
             except Exception:
                 st.session_state.finance_revenue = {}
         try:
@@ -1449,20 +1485,17 @@ if fin_revenue > 0:
         c2, "card-sales", "💰", "ПРОДАЖИ",
         main_val=f"₽{fin_revenue:,.0f}".replace(",", " "),
         sep="/",
-        sub_val=f"партнёры ₽{fin_partner:,.0f}".replace(",", " ") if fin_partner else f"конв. {cvr:.1f}%",
+        sub_val=f"конв. {cvr:.1f}%",
         delta="Финансы · продажи и возвраты",
         delta_cls="delta-pos",
     )
 else:
-    # Показываем сырые ключи для отладки
-    _raw_keys = list(finance_revenue.get("raw", {}).keys()) if finance_revenue else []
-    _raw_str  = ", ".join(_raw_keys[:4]) if _raw_keys else "нет ответа"
     dual_card(
         c2, "card-sales", "💰", "ПРОДАЖИ",
         main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
         sep="/",
         sub_val=f"{total_orders:,} шт".replace(",", " "),
-        delta=f"API: {_raw_str}",
+        delta="Загрузите данные",
         delta_cls="delta-neu",
     )
 
