@@ -1084,6 +1084,12 @@ if "df" not in st.session_state or fetch_btn:
                     st.session_state.supply_in_transit = load_real_supply_in_transit(client_id, api_key)
                 except Exception:
                     st.session_state.supply_in_transit = []
+                try:
+                    load_real_finance_revenue.clear()
+                    st.session_state.finance_revenue = load_real_finance_revenue(
+                        client_id, api_key, kdf_str, kdt_str)
+                except Exception:
+                    st.session_state.finance_revenue = {}
                 st.session_state.data_error = None
         except Exception as e:
             st.session_state.data_error   = str(e)
@@ -1450,12 +1456,13 @@ if fin_revenue > 0:
 else:
     # Показываем сырые ключи для отладки
     _raw_keys = list(finance_revenue.get("raw", {}).keys()) if finance_revenue else []
+    _raw_str  = ", ".join(_raw_keys[:4]) if _raw_keys else "нет ответа"
     dual_card(
         c2, "card-sales", "💰", "ПРОДАЖИ",
         main_val=f"₽{total_revenue:,.0f}".replace(",", " "),
         sep="/",
         sub_val=f"{total_orders:,} шт".replace(",", " "),
-        delta=f"Фин. данные: {_raw_keys[:3]}" if _raw_keys else "Загрузите данные",
+        delta=f"API: {_raw_str}",
         delta_cls="delta-neu",
     )
 
